@@ -5,6 +5,7 @@ import path from "node:path";
 import {
   DEFAULT_CONFIG_PATH,
   computeGitSignal,
+  distillTranscriptEntries,
   ensureHandoffFile,
   extractStartupContext,
   loadConfig,
@@ -80,23 +81,7 @@ function parseArgs(argv) {
   return { flags, positionals };
 }
 
-function extractTextFromMessageContent(content) {
-  if (typeof content === "string") return content.trim();
-  if (Array.isArray(content)) {
-    return content
-      .map((part) => {
-        if (typeof part === "string") return part;
-        if (part && typeof part === "object" && typeof part.text === "string") {
-          return part.text;
-        }
-        return "";
-      })
-      .filter(Boolean)
-      .join("\n")
-      .trim();
-  }
-  return "";
-}
+const CLI_TRANSCRIPT_MAX_BYTES = 48 * 1024;
 
 function extractTranscriptFromFile(transcriptPath, maxReadBytes = 256 * 1024) {
   if (!transcriptPath || typeof transcriptPath !== "string") return "";
@@ -126,14 +111,7 @@ function extractTranscriptFromFile(transcriptPath, maxReadBytes = 256 * 1024) {
       try {
         const doc = JSON.parse(trimmed);
         if (Array.isArray(doc.messages)) {
-          return doc.messages
-            .map((m) => {
-              const role = m.role || m.type || "message";
-              const txt = extractTextFromMessageContent(m.content ?? m.text ?? "");
-              return txt ? `[${role}]: ${txt}` : "";
-            })
-            .filter(Boolean)
-            .join("\n\n");
+          return distillTranscriptEntries(doc.messages, CLI_TRANSCRIPT_MAX_BYTES);
         }
       } catch {
         // fall through to JSONL parsing
@@ -141,28 +119,17 @@ function extractTranscriptFromFile(transcriptPath, maxReadBytes = 256 * 1024) {
     }
 
     // Parse JSONL lines (Claude Code / Gemini CLI session logs)
-    const formatted = [];
+    const entries = [];
     for (const line of trimmed.split(/\r?\n/)) {
       const l = line.trim();
       if (!l) continue;
       try {
-        const entry = JSON.parse(l);
-        const role =
-          entry?.message?.role || entry?.role || entry?.type || "entry";
-        if (role === "system" || role === "summary" || role === "file-history-snapshot") {
-          continue;
-        }
-        const content =
-          entry?.message?.content ?? entry?.content ?? entry?.text ?? "";
-        const txt = extractTextFromMessageContent(content);
-        if (txt) {
-          formatted.push(`[${role}]: ${txt}`);
-        }
+        entries.push(JSON.parse(l));
       } catch {
-        formatted.push(l);
+        entries.push(l);
       }
     }
-    return formatted.join("\n\n");
+    return distillTranscriptEntries(entries, CLI_TRANSCRIPT_MAX_BYTES);
   } catch {
     return "";
   }
@@ -453,18 +420,20 @@ function resolveHookTranscriptPath(payload, cwd, host) {
 
 function extractInlinePayloadTranscript(payload) {
   if (typeof payload?.transcript === "string" && payload.transcript.trim()) {
-    return payload.transcript.trim();
+    const raw = payload.transcript.trim();
+    if (/^\[[a-z0-9_-]+\]:/im.test(raw)) {
+      const entries = raw
+        .split(/\n\n(?=\[[a-z0-9_-]+\]:)/i)
+        .map((chunk) => {
+          const m = chunk.match(/^\[([a-z0-9_-]+)\]:\s*([\s\S]*)$/i);
+          return m ? { role: m[1].toLowerCase(), content: m[2].trim() } : chunk;
+        });
+      return distillTranscriptEntries(entries, CLI_TRANSCRIPT_MAX_BYTES);
+    }
+    return distillTranscriptEntries([raw], CLI_TRANSCRIPT_MAX_BYTES);
   }
   if (Array.isArray(payload?.messages)) {
-    return payload.messages
-      .map((m) => {
-        if (!m || typeof m !== "object") return "";
-        const role = m.role || m.type || "message";
-        const txt = extractTextFromMessageContent(m.content ?? m.text ?? "");
-        return txt ? `[${role}]: ${txt}` : "";
-      })
-      .filter(Boolean)
-      .join("\n\n");
+    return distillTranscriptEntries(payload.messages, CLI_TRANSCRIPT_MAX_BYTES);
   }
   return "";
 }

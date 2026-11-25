@@ -25,6 +25,10 @@
 
 <!-- Append-only non-obvious traps, dead ends, and constraints. Preserved and deduplicated across updates. -->
 
+## Open questions
+
+<!-- Regenerated on each capture with unresolved questions, open tradeoffs, or items awaiting confirmation. -->
+
 ## Commands
 
 <!-- Build, test, and verification commands. Preserved across automatic updates. -->

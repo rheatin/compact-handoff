@@ -22,8 +22,11 @@ export const TEMPLATE_PATH = path.resolve(
 );
 
 export const DIFF_BUDGET_BYTES = 45 * 1024; // 45 KB fair-share diff budget
+export const COMBINED_EVIDENCE_BUDGET_BYTES = 57 * 1024; // 45 KB diff + 12 KB baseline
+export const TRANSCRIPT_MIN_BUDGET_BYTES = 12 * 1024; // 12 KB floor when diff is full
+export const TRANSCRIPT_MAX_BUDGET_BYTES = 48 * 1024; // 48 KB max when diff is empty/minimal
 const UNTRACKED_FILE_MAX_BYTES = 16 * 1024;
-const TRANSCRIPT_MAX_BYTES = 60 * 1024;
+const TRANSCRIPT_MAX_BYTES = TRANSCRIPT_MAX_BUDGET_BYTES;
 
 export const DEFAULT_CONFIG = Object.freeze({
   trigger: Object.freeze({
@@ -63,6 +66,10 @@ export const DEFAULT_TEMPLATE = `# Handoff
 ## Gotchas / constraints
 
 <!-- Append-only non-obvious traps, dead ends, and constraints. Preserved and deduplicated across updates. -->
+
+## Open questions
+
+<!-- Regenerated on each capture with unresolved questions, open tradeoffs, or items awaiting confirmation. -->
 
 ## Commands
 
@@ -841,6 +848,7 @@ export function gatherGitContext(cwd, lastHead = null) {
       commitsSinceLastCapture: "",
       diffStat: "",
       diff: "",
+      untrackedFiles: [],
       text: "(not a git repository)",
       toString() {
         return this.text;
@@ -990,6 +998,7 @@ export function gatherGitContext(cwd, lastHead = null) {
     commitsSinceLastCapture,
     diffStat,
     diff,
+    untrackedFiles,
     text,
     toString() {
       return this.text;
@@ -998,8 +1007,652 @@ export function gatherGitContext(cwd, lastHead = null) {
 }
 
 // ---------------------------------------------------------------------------
+// Dynamic Transcript Budget & User-Intent-First Distillation
+// ---------------------------------------------------------------------------
+
+const TRANSCRIPT_STARTUP_MARKER = "[Handoff Context from HANDOFF.md]";
+const TRANSCRIPT_COMMAND_MARKER = "[Handoff Command Instructions]";
+const TRANSCRIPT_USER_MSG_MAX_BYTES = 4 * 1024;
+const TRANSCRIPT_ASSISTANT_MSG_MAX_BYTES = 4 * 1024;
+const TRANSCRIPT_FIRST_USER_MAX_BYTES = 2 * 1024;
+const TRANSCRIPT_MIDDLE_USER_SHORT_BYTES = 300;
+const TRANSCRIPT_PROSE_COLLAPSE_BYTES = 240;
+
+const TRANSCRIPT_PATH_KEYS = new Set([
+  "filePath",
+  "file_path",
+  "path",
+  "target_file",
+  "targetFile",
+  "notebook_path",
+  "destination",
+]);
+
+function truncateUtf8Text(text, maxBytes, suffix = "\n... [truncated]") {
+  if (!text) return "";
+  if (maxBytes <= 0) return "";
+  if (Buffer.byteLength(text, "utf8") <= maxBytes) return text;
+  const suffixBytes = Buffer.byteLength(suffix, "utf8");
+  const target = Math.max(0, maxBytes - suffixBytes);
+  if (target === 0) {
+    let rawBuf = Buffer.from(suffix, "utf8").subarray(0, maxBytes);
+    while (rawBuf.length > 0 && (rawBuf[rawBuf.length - 1] & 0b11000000) === 0b10000000) {
+      rawBuf = rawBuf.subarray(0, rawBuf.length - 1);
+    }
+    if (rawBuf.length > 0 && rawBuf[rawBuf.length - 1] >= 0b11000000) {
+      rawBuf = rawBuf.subarray(0, rawBuf.length - 1);
+    }
+    return rawBuf.toString("utf8");
+  }
+
+  let buf = Buffer.from(text, "utf8").subarray(0, target);
+  while (buf.length > 0 && (buf[buf.length - 1] & 0b11000000) === 0b10000000) {
+    buf = buf.subarray(0, buf.length - 1);
+  }
+  if (buf.length > 0 && buf[buf.length - 1] >= 0b11000000) {
+    buf = buf.subarray(0, buf.length - 1);
+  }
+  return `${buf.toString("utf8")}${suffix}`;
+}
+
+export function calculateTranscriptBudget(gitContext) {
+  let diffBytes = 0;
+  if (gitContext && typeof gitContext === "object") {
+    if (typeof gitContext.diff === "string" && gitContext.diff) {
+      diffBytes = Buffer.byteLength(gitContext.diff, "utf8");
+    }
+  }
+  const available = COMBINED_EVIDENCE_BUDGET_BYTES - diffBytes;
+  return Math.max(
+    TRANSCRIPT_MIN_BUDGET_BYTES,
+    Math.min(TRANSCRIPT_MAX_BUDGET_BYTES, available),
+  );
+}
+
+function collectTranscriptTouchedPaths(value, out, depth = 0) {
+  if (!value || depth > 3 || out.size >= 24) return;
+  if (typeof value === "object") {
+    if (Array.isArray(value)) {
+      for (const item of value) {
+        collectTranscriptTouchedPaths(item, out, depth + 1);
+      }
+      return;
+    }
+    for (const [key, val] of Object.entries(value)) {
+      if (TRANSCRIPT_PATH_KEYS.has(key) && typeof val === "string") {
+        const trimmed = val.trim();
+        if (trimmed && !/^https?:\/\//i.test(trimmed)) {
+          out.add(trimmed);
+        }
+      } else if ((key === "files" || key === "paths") && Array.isArray(val)) {
+        for (const entry of val) {
+          if (typeof entry === "string" && entry.trim()) {
+            out.add(entry.trim());
+          } else {
+            collectTranscriptTouchedPaths(entry, out, depth + 1);
+          }
+        }
+      } else if (val && typeof val === "object") {
+        collectTranscriptTouchedPaths(val, out, depth + 1);
+      }
+    }
+  }
+}
+
+function stripLongCodeBlocks(text) {
+  const lines = text.replace(/\r\n/g, "\n").split("\n");
+  const out = [];
+  let inFence = false;
+  let fenceChar = "";
+  let fenceLen = 0;
+  let fenceLang = "";
+  let fenceOpenLine = "";
+  let fenceBody = [];
+
+  for (const line of lines) {
+    if (!inFence) {
+      const openMatch = line.match(/^\s*(`{3,}|~{3,})(.*)$/);
+      if (openMatch) {
+        inFence = true;
+        fenceChar = openMatch[1][0];
+        fenceLen = openMatch[1].length;
+        fenceLang = (openMatch[2] || "").trim().split(/\s+/)[0] || "text";
+        fenceOpenLine = line;
+        fenceBody = [];
+        continue;
+      }
+      out.push(line);
+    } else {
+      const closeRe = new RegExp(`^\\s*${fenceChar}{${fenceLen},}\\s*$`);
+      if (closeRe.test(line)) {
+        if (fenceBody.length > 8) {
+          out.push(`[code block omitted: ${fenceLang}, ${fenceBody.length} lines]`);
+        } else {
+          out.push(fenceOpenLine, ...fenceBody, line);
+        }
+        inFence = false;
+        fenceChar = "";
+        fenceLen = 0;
+        fenceLang = "";
+        fenceOpenLine = "";
+        fenceBody = [];
+      } else {
+        fenceBody.push(line);
+      }
+    }
+  }
+
+  if (inFence) {
+    if (fenceBody.length > 8) {
+      out.push(`[code block omitted: ${fenceLang}, ${fenceBody.length} lines]`);
+    } else {
+      out.push(fenceOpenLine, ...fenceBody);
+    }
+  }
+
+  return out.join("\n");
+}
+
+function collapseProseParagraph(proseLines) {
+  const collapsed = proseLines
+    .map((l) => l.trim())
+    .filter(Boolean)
+    .join(" ")
+    .replace(/\s+/g, " ")
+    .trim();
+  if (!collapsed) return "";
+  if (Buffer.byteLength(collapsed, "utf8") <= TRANSCRIPT_PROSE_COLLAPSE_BYTES) {
+    return collapsed;
+  }
+  const trailingQuestionMatch = collapsed.match(/([^.!?。！？\n]{4,180}[?？])\s*$/);
+  if (trailingQuestionMatch) {
+    const q = trailingQuestionMatch[1].trim();
+    const qBytes = Buffer.byteLength(q, "utf8");
+    const headBudget = Math.max(40, TRANSCRIPT_PROSE_COLLAPSE_BYTES - qBytes - 6);
+    const head = truncateUtf8Text(collapsed.slice(0, collapsed.length - q.length).trim(), headBudget, "...");
+    return `${head} ${q}`;
+  }
+  return truncateUtf8Text(collapsed, TRANSCRIPT_PROSE_COLLAPSE_BYTES, "...");
+}
+
+function distillAssistantText(text) {
+  if (!text) return "";
+  const withoutLongCode = stripLongCodeBlocks(text);
+  const lines = withoutLongCode.split("\n");
+  const out = [];
+  let proseBuf = [];
+  let inShortFence = false;
+  let shortFenceChar = "";
+  let shortFenceLen = 0;
+  let lastWasList = false;
+
+  const flushProse = () => {
+    if (proseBuf.length === 0) return;
+    const collapsed = collapseProseParagraph(proseBuf);
+    if (collapsed) out.push(collapsed);
+    proseBuf = [];
+  };
+
+  for (const line of lines) {
+    if (inShortFence) {
+      out.push(line);
+      const closeRe = new RegExp(`^\\s*${shortFenceChar}{${shortFenceLen},}\\s*$`);
+      if (closeRe.test(line)) {
+        inShortFence = false;
+        shortFenceChar = "";
+        shortFenceLen = 0;
+      }
+      continue;
+    }
+
+    const fenceOpen = line.match(/^\s*(`{3,}|~{3,})(.*)$/);
+    if (fenceOpen) {
+      flushProse();
+      lastWasList = false;
+      inShortFence = true;
+      shortFenceChar = fenceOpen[1][0];
+      shortFenceLen = fenceOpen[1].length;
+      out.push(line);
+      continue;
+    }
+
+    const trimmed = line.trim();
+    if (!trimmed) {
+      flushProse();
+      lastWasList = false;
+      if (out.length > 0 && out[out.length - 1] !== "") {
+        out.push("");
+      }
+      continue;
+    }
+
+    const isHeading = /^#{1,6}\s+\S/.test(trimmed);
+    const isList = /^(?:[-*+]|\d+\.)\s+\S/.test(trimmed);
+    const isListContinuation = lastWasList && /^\s{2,}\S/.test(line);
+    const hasBold = /\*\*[^*\n]+\*\*/.test(trimmed);
+    const isQuestion = /[?？]\s*$/.test(trimmed);
+    const isOmittedMarker = /^\[code block omitted:/.test(trimmed);
+    const isFilesTouched = /^\[files touched:/.test(trimmed);
+
+    if (
+      isHeading ||
+      isList ||
+      isListContinuation ||
+      hasBold ||
+      isQuestion ||
+      isOmittedMarker ||
+      isFilesTouched
+    ) {
+      flushProse();
+      out.push(isHeading || isOmittedMarker || isFilesTouched ? trimmed : line.trimEnd());
+      lastWasList = isList || isListContinuation;
+      continue;
+    }
+
+    lastWasList = false;
+    proseBuf.push(trimmed);
+  }
+
+  flushProse();
+  return out
+    .join("\n")
+    .replace(/\n{3,}/g, "\n\n")
+    .trim();
+}
+
+function normalizeTranscriptEntry(rawEntry) {
+  if (typeof rawEntry === "string") {
+    const trimmed = rawEntry.trim();
+    if (
+      !trimmed ||
+      trimmed.startsWith(TRANSCRIPT_STARTUP_MARKER) ||
+      trimmed.startsWith(TRANSCRIPT_COMMAND_MARKER)
+    ) {
+      return null;
+    }
+    return {
+      role: "entry",
+      text: `[entry]: ${truncateUtf8Text(redactSecrets(trimmed), TRANSCRIPT_ASSISTANT_MSG_MAX_BYTES)}`,
+    };
+  }
+  if (!rawEntry || typeof rawEntry !== "object") return null;
+
+  const hasMessageObj =
+    rawEntry.message && typeof rawEntry.message === "object";
+  const entry = hasMessageObj ? rawEntry.message : rawEntry;
+  const info =
+    entry.info && typeof entry.info === "object"
+      ? entry.info
+      : rawEntry.info && typeof rawEntry.info === "object"
+        ? rawEntry.info
+        : null;
+
+  if (
+    entry.customType === "handoff-context" ||
+    rawEntry.customType === "handoff-context"
+  ) {
+    return null;
+  }
+
+  const rawType = String(rawEntry.type ?? "").trim().toLowerCase();
+  if (
+    [
+      "system",
+      "summary",
+      "file-history-snapshot",
+      "compaction",
+      "branch_summary",
+      "thinking_level_change",
+      "model_change",
+      "session",
+      "progress",
+    ].includes(rawType)
+  ) {
+    return null;
+  }
+  if (
+    rawType &&
+    !["message", "custom_message", "user", "assistant", "model", "entry"].includes(rawType) &&
+    !entry.role &&
+    !info?.role
+  ) {
+    return null;
+  }
+
+  let role = String(
+    info?.role ??
+      entry.role ??
+      (rawType === "custom_message" ? "custom" : rawType || "message"),
+  )
+    .trim()
+    .toLowerCase();
+
+  if (role === "model") role = "assistant";
+  if (role === "system") return null;
+  if (role === "toolresult" && !entry.isError) return null;
+
+  const textChunks = [];
+  const touchedPaths = new Set();
+
+  const blocks = Array.isArray(entry.parts)
+    ? entry.parts
+    : Array.isArray(info?.parts)
+      ? info.parts
+      : Array.isArray(entry.content)
+        ? entry.content
+        : Array.isArray(info?.content)
+          ? info.content
+          : null;
+
+  if (blocks) {
+    for (const block of blocks) {
+      if (!block) continue;
+      if (typeof block === "string") {
+        const trimmed = block.trim();
+        if (
+          trimmed &&
+          !trimmed.startsWith(TRANSCRIPT_STARTUP_MARKER) &&
+          !trimmed.startsWith(TRANSCRIPT_COMMAND_MARKER)
+        ) {
+          textChunks.push(trimmed);
+        }
+        continue;
+      }
+      if (typeof block !== "object") continue;
+
+      const bType = String(block.type ?? "").toLowerCase();
+      if (bType === "text" || (!bType && typeof block.text === "string")) {
+        const txt = typeof block.text === "string" ? block.text.trim() : "";
+        if (
+          txt &&
+          !txt.startsWith(TRANSCRIPT_STARTUP_MARKER) &&
+          !txt.startsWith(TRANSCRIPT_COMMAND_MARKER)
+        ) {
+          textChunks.push(txt);
+        }
+        continue;
+      }
+
+      if (
+        bType === "tool" ||
+        bType === "tool-invocation" ||
+        bType === "tool_use" ||
+        bType === "tool-call" ||
+        bType === "toolcall" ||
+        bType === "tool_call"
+      ) {
+        collectTranscriptTouchedPaths(block.state?.input, touchedPaths);
+        collectTranscriptTouchedPaths(block.input, touchedPaths);
+        collectTranscriptTouchedPaths(block.args, touchedPaths);
+        collectTranscriptTouchedPaths(block.arguments, touchedPaths);
+        collectTranscriptTouchedPaths(block.toolInvocation?.args, touchedPaths);
+      }
+    }
+  } else {
+    const rawText =
+      typeof entry.content === "string"
+        ? entry.content
+        : typeof entry.text === "string"
+          ? entry.text
+          : typeof info?.content === "string"
+            ? info.content
+            : typeof info?.text === "string"
+              ? info.text
+              : "";
+    const trimmed = rawText.trim();
+    if (
+      trimmed &&
+      !trimmed.startsWith(TRANSCRIPT_STARTUP_MARKER) &&
+      !trimmed.startsWith(TRANSCRIPT_COMMAND_MARKER)
+    ) {
+      textChunks.push(trimmed);
+    }
+  }
+
+  if (Array.isArray(entry.toolCalls)) {
+    collectTranscriptTouchedPaths(entry.toolCalls, touchedPaths);
+  }
+
+  const rawBody = redactSecrets(textChunks.join("\n").trim());
+  const bodyText =
+    role === "user"
+      ? truncateUtf8Text(rawBody, TRANSCRIPT_USER_MSG_MAX_BYTES)
+      : truncateUtf8Text(
+          distillAssistantText(rawBody),
+          TRANSCRIPT_ASSISTANT_MSG_MAX_BYTES,
+        );
+
+  const filesNote =
+    touchedPaths.size > 0
+      ? `[files touched: ${[...touchedPaths].join(", ")}]`
+      : "";
+
+  if (!bodyText && !filesNote) return null;
+  const combined = [bodyText, filesNote].filter(Boolean).join("\n");
+  return {
+    role,
+    text: `[${role}]: ${combined}`,
+  };
+}
+
+function packDistilledItems(items, maxBytes) {
+  if (!Array.isArray(items) || items.length === 0 || maxBytes <= 0) return "";
+
+  const full = items.map((item) => item.text).join("\n\n");
+  if (Buffer.byteLength(full, "utf8") <= maxBytes) {
+    return full;
+  }
+
+  const marker = "... [earlier messages omitted]";
+  const markerBytes = Buffer.byteLength(marker, "utf8");
+  const firstUserIdx = items.findIndex((item) => item.role === "user");
+  const chosenText = new Map();
+
+  if (firstUserIdx !== -1) {
+    const pinnedCap = Math.min(
+      TRANSCRIPT_FIRST_USER_MAX_BYTES,
+      Math.max(128, Math.floor(maxBytes / 3)),
+    );
+    chosenText.set(firstUserIdx, truncateUtf8Text(items[firstUserIdx].text, pinnedCap));
+  }
+
+  const startIdx = firstUserIdx !== -1 ? firstUserIdx + 1 : 0;
+  const pinnedBytes =
+    firstUserIdx !== -1
+      ? Buffer.byteLength(chosenText.get(firstUserIdx), "utf8") + 2
+      : 0;
+  const remainingAfterPinned = Math.max(0, maxBytes - pinnedBytes);
+
+  // Reserve marker overhead for gaps between pinned first / middle / tail
+  const maxMarkerReserve = Math.min(remainingAfterPinned, (markerBytes + 4) * 2);
+  const usableBudget = Math.max(0, remainingAfterPinned - maxMarkerReserve);
+  const tailBudgetTarget = Math.floor(usableBudget * 0.55);
+
+  let tailBytesUsed = 0;
+  let tailStartIdx = items.length;
+  for (let i = items.length - 1; i >= startIdx; i--) {
+    const candidate = items[i].text;
+    const sep = tailStartIdx < items.length ? 2 : 0;
+    const cost = Buffer.byteLength(candidate, "utf8") + sep;
+    if (tailBytesUsed + cost <= tailBudgetTarget) {
+      chosenText.set(i, candidate);
+      tailBytesUsed += cost;
+      tailStartIdx = i;
+    } else if (tailStartIdx === items.length && usableBudget > 0) {
+      const cap = Math.max(0, Math.min(usableBudget, tailBudgetTarget || usableBudget));
+      if (cap > 0) {
+        chosenText.set(i, truncateUtf8Text(candidate, cap));
+        tailBytesUsed += Buffer.byteLength(chosenText.get(i), "utf8");
+        tailStartIdx = i;
+      }
+      break;
+    } else {
+      break;
+    }
+  }
+
+  let middleBudget = Math.max(0, usableBudget - tailBytesUsed);
+  const middleUserIndices = [];
+  for (let i = startIdx; i < tailStartIdx; i++) {
+    if (items[i].role === "user") {
+      middleUserIndices.push(i);
+    }
+  }
+
+  if (middleUserIndices.length > 0 && middleBudget > 0) {
+    const fullMiddleCost = middleUserIndices.reduce(
+      (sum, idx, pos) =>
+        sum + Buffer.byteLength(items[idx].text, "utf8") + (pos > 0 ? 2 : 0),
+      0,
+    );
+
+    if (fullMiddleCost <= middleBudget) {
+      for (const idx of middleUserIndices) {
+        chosenText.set(idx, items[idx].text);
+      }
+      middleBudget -= fullMiddleCost + 2;
+    } else {
+      const shortened = middleUserIndices.map((idx) => ({
+        idx,
+        text: truncateUtf8Text(
+          items[idx].text,
+          TRANSCRIPT_MIDDLE_USER_SHORT_BYTES,
+          "...",
+        ),
+      }));
+      const shortenedCost = shortened.reduce(
+        (sum, entry, pos) =>
+          sum + Buffer.byteLength(entry.text, "utf8") + (pos > 0 ? 2 : 0),
+        0,
+      );
+
+      if (shortenedCost <= middleBudget) {
+        for (const entry of shortened) {
+          chosenText.set(entry.idx, entry.text);
+        }
+        middleBudget -= shortenedCost + 2;
+      } else {
+        // Sample evenly across middle user turns to preserve intent trajectory
+        let used = 0;
+        const picked = [];
+        const step = Math.max(
+          1,
+          Math.ceil(shortenedCost / Math.max(1, middleBudget)),
+        );
+        for (let k = 0; k < shortened.length; k += step) {
+          const entry = shortened[k];
+          const sep = picked.length > 0 ? 2 : 0;
+          const cost = Buffer.byteLength(entry.text, "utf8") + sep;
+          if (used + cost <= middleBudget) {
+            picked.push(entry);
+            used += cost;
+          }
+        }
+        // Fill any remaining middle budget with unpicked user turns
+        if (used < middleBudget) {
+          const pickedSet = new Set(picked.map((p) => p.idx));
+          for (const entry of shortened) {
+            if (pickedSet.has(entry.idx)) continue;
+            const sep = picked.length > 0 ? 2 : 0;
+            const cost = Buffer.byteLength(entry.text, "utf8") + sep;
+            if (used + cost <= middleBudget) {
+              picked.push(entry);
+              pickedSet.add(entry.idx);
+              used += cost;
+            }
+          }
+        }
+        for (const entry of picked) {
+          chosenText.set(entry.idx, entry.text);
+        }
+        if (picked.length > 0) {
+          middleBudget = Math.max(0, middleBudget - used - 2);
+        }
+      }
+    }
+  }
+
+  // Fill any remaining budget from the most recent unselected turns backward
+  for (let i = tailStartIdx - 1; i >= startIdx && middleBudget > 0; i--) {
+    if (chosenText.has(i)) continue;
+    const candidate = items[i].text;
+    const cost = Buffer.byteLength(candidate, "utf8") + 2;
+    if (cost <= middleBudget) {
+      chosenText.set(i, candidate);
+      middleBudget -= cost;
+    }
+  }
+
+  const orderedIndices = [...chosenText.keys()].sort((a, b) => a - b);
+  const segments = [];
+  for (let k = 0; k < orderedIndices.length; k++) {
+    const idx = orderedIndices[k];
+    if (k === 0 && idx > 0) {
+      segments.push(marker);
+    } else if (k > 0 && idx > orderedIndices[k - 1] + 1) {
+      segments.push(marker);
+    }
+    segments.push(chosenText.get(idx));
+  }
+
+  const assembled = segments.join("\n\n");
+  return truncateUtf8Text(assembled, maxBytes);
+}
+
+function repackDistilledTranscript(transcriptText, maxBytes) {
+  if (!transcriptText || Buffer.byteLength(transcriptText, "utf8") <= maxBytes) {
+    return transcriptText || "";
+  }
+  const chunks = transcriptText
+    .split(/\n\n(?=\[(?:user|assistant|model|custom|entry|message)\]:)/)
+    .map((c) => c.trim())
+    .filter(Boolean);
+  if (chunks.length >= 2) {
+    const items = chunks.map((chunk) => {
+      const m = chunk.match(/^\[([a-z0-9_-]+)\]:/i);
+      const role = m ? m[1].toLowerCase() : "message";
+      return { role: role === "model" ? "assistant" : role, text: chunk };
+    });
+    return packDistilledItems(items, maxBytes);
+  }
+  return truncateUtf8Text(transcriptText, maxBytes, "\n... [transcript truncated]");
+}
+
+export function distillTranscriptEntries(
+  entries,
+  maxBytes = TRANSCRIPT_MAX_BUDGET_BYTES,
+) {
+  if (!Array.isArray(entries) || entries.length === 0 || maxBytes <= 0) {
+    return "";
+  }
+  const items = [];
+  for (const raw of entries) {
+    const norm = normalizeTranscriptEntry(raw);
+    if (norm) items.push(norm);
+  }
+  return packDistilledItems(items, maxBytes);
+}
+
+// ---------------------------------------------------------------------------
 // Prompt Construction & LLM Output Parsing
 // ---------------------------------------------------------------------------
+
+export function detectDiscussionMode(gitContext) {
+  if (!gitContext) return true;
+  if (typeof gitContext === "string") {
+    const trimmed = gitContext.trim();
+    if (!trimmed || trimmed.includes("(not a git repository)")) return true;
+    return (
+      trimmed.includes("Working tree status:\n(clean)") &&
+      !trimmed.includes("Diff (")
+    );
+  }
+  return (
+    !gitContext.status &&
+    !gitContext.diff &&
+    (!gitContext.untrackedFiles || gitContext.untrackedFiles.length === 0)
+  );
+}
 
 export function buildCapturePrompt({
   existingHandoff = "",
@@ -1011,14 +1664,38 @@ export function buildCapturePrompt({
     typeof gitContext === "string"
       ? gitContext
       : gitContext?.text || "(no git context)";
+  const isDiscussionMode = detectDiscussionMode(gitContext);
+  const transcriptBudget =
+    gitContext && typeof gitContext === "object"
+      ? calculateTranscriptBudget(gitContext)
+      : TRANSCRIPT_MAX_BYTES;
+
   const safeHandoff = redactSecrets(existingHandoff || "(none)");
-  const safeTranscript = truncateUtf8ToBytes(
-    redactSecrets(transcriptText || "(no transcript available)"),
-    TRANSCRIPT_MAX_BYTES,
-    "\n... [transcript truncated]",
-  );
+  const safeTranscript = transcriptText
+    ? repackDistilledTranscript(redactSecrets(transcriptText), transcriptBudget)
+    : "(no transcript available)";
+
+  const modeGuidance = isDiscussionMode
+    ? `Mode: Design / Planning / Research Discussion Mode (zero uncommitted or new git changes detected).
+Focus on extracting high-signal planning, architecture, and research state from the session transcript:
+- current_status.done: Aligned design conclusions, researched files/modules (cite \`path:line\` or symbol names), and settled questions.
+- current_status.in_progress: Topics still under active discussion, design exploration, or investigation.
+- current_status.next: Concrete next alignment decision or first implementation step to execute.
+- new_decisions: Every agreed design choice, constraint, user preference, and rejected alternatives with rationale ("Chose X over Y because Z").
+- new_gotchas: Architectural constraints, invariants, or edge cases uncovered during research.
+- open_questions: Unresolved questions, open tradeoffs, or items awaiting user confirmation (return [] if all resolved).`
+    : `Mode: Code & Implementation Mode.
+Focus on extracting code progress, architectural decisions, and remaining verification steps:
+- current_status.done: Completed changes, verified checks, and settled items.
+- current_status.in_progress: Active/unfinished work in progress.
+- current_status.next: Single concrete, actionable next step for the next agent to execute.
+- new_decisions: New design choices with rationale and rejected alternatives ("Chose X over Y because Z").
+- new_gotchas: Non-obvious traps, dead ends, failed approaches, or environment constraints discovered.
+- open_questions: Any unresolved questions, open tradeoffs, or items awaiting user confirmation (return [] if none).`;
 
   return `You are updating a project's cross-agent HANDOFF.md document for session continuity (capturing from agent: ${agentName}).
+
+${modeGuidance}
 
 Analyze the existing HANDOFF.md, git repository state, and session transcript below, then return ONLY a single valid JSON object matching this exact schema (no prose outside JSON, no markdown code fences):
 
@@ -1033,6 +1710,9 @@ Analyze the existing HANDOFF.md, git repository state, and session transcript be
   ],
   "new_gotchas": [
     "Non-obvious trap, dead end, failed approach, or environment constraint discovered"
+  ],
+  "open_questions": [
+    "Unresolved question, open tradeoff, or item awaiting user confirmation"
   ]
 }
 
@@ -1041,7 +1721,8 @@ Strict rules:
 2. Concise, specific bullets: Keep each bullet to 1-2 crisp sentences citing exact file paths, functions, or commands where relevant.
 3. Current status: Carry forward still-relevant items from the existing HANDOFF.md, promote completed items from in_progress to done, and ensure "next" is a non-empty string naming the immediate next task.
 4. Decisions & gotchas (append-only deltas): Return ONLY new decisions and new gotchas not already listed in existing Decision log or Gotchas / constraints. Record dead ends and rejected approaches ("Tried X, failed/rejected because Y") so the next agent does not repeat mistakes. Do NOT prefix dates on new_decisions.
-5. Secret safety: Never output API keys, tokens, passwords, or private credentials.
+5. Open questions (current snapshot): Return ONLY currently unresolved questions/tradeoffs/confirmations. Omit resolved questions so the section stays clean.
+6. Secret safety: Never output API keys, tokens, passwords, or private credentials.
 
 <existing_handoff>
 ${safeHandoff}
@@ -1177,6 +1858,7 @@ export function parseLLMResult(rawText) {
     },
     new_decisions: normalizeStringArray(parsed.new_decisions),
     new_gotchas: normalizeStringArray(parsed.new_gotchas),
+    open_questions: normalizeStringArray(parsed.open_questions),
   };
 }
 
@@ -1347,6 +2029,16 @@ function renderCurrentStatusSection(currentStatus, eol, isLastSection) {
   return isLastSection ? `${body}${eol}` : `${body}${eol}${eol}`;
 }
 
+function renderOpenQuestionsSection(openQuestions, eol, isLastSection) {
+  const lines =
+    openQuestions && openQuestions.length > 0
+      ? openQuestions.map((item) => `- ${item}`)
+      : ["- (none)"];
+
+  const body = ["## Open questions", "", ...lines].join(eol);
+  return isLastSection ? `${body}${eol}` : `${body}${eol}${eol}`;
+}
+
 function appendDeduplicatedBullets(
   sectionSlice,
   incomingItems,
@@ -1404,6 +2096,7 @@ export function applyUpdate(existingContent, parsedResult, meta = {}) {
           },
           new_decisions: normalizeStringArray(parsedResult.new_decisions),
           new_gotchas: normalizeStringArray(parsedResult.new_gotchas),
+          open_questions: normalizeStringArray(parsedResult.open_questions),
         }
       : parseLLMResult(JSON.stringify(parsedResult));
 
@@ -1436,6 +2129,7 @@ export function applyUpdate(existingContent, parsedResult, meta = {}) {
   let sawCurrentStatus = false;
   let sawDecisions = false;
   let sawGotchas = false;
+  let sawOpenQuestions = false;
 
   const renderedSections = sections.map((sec, idx) => {
     const rawSlice = baseContent.slice(sec.start, sec.end);
@@ -1465,6 +2159,10 @@ export function applyUpdate(existingContent, parsedResult, meta = {}) {
         isLastSection: isLast,
       });
     }
+    if (sec.norm === "open questions" || sec.norm === "open question") {
+      sawOpenQuestions = true;
+      return renderOpenQuestionsSection(validated.open_questions, eol, isLast);
+    }
     // Preserve ## Overview, ## Commands, and any custom sections byte-for-byte
     return rawSlice;
   });
@@ -1493,6 +2191,11 @@ export function applyUpdate(existingContent, parsedResult, meta = {}) {
       ),
     );
   }
+  if (!sawOpenQuestions && validated.open_questions.length > 0) {
+    missingBlocks.push(
+      renderOpenQuestionsSection(validated.open_questions, eol, false),
+    );
+  }
 
   if (missingBlocks.length > 0) {
     const commandsIdx = sections.findIndex((s) => s.norm === "commands");
@@ -1507,6 +2210,8 @@ export function applyUpdate(existingContent, parsedResult, meta = {}) {
           `${renderedSections[renderedSections.length - 1].replace(/\s+$/, "")}${eol}${eol}`;
       }
       renderedSections.push(...missingBlocks);
+      renderedSections[renderedSections.length - 1] =
+        `${renderedSections[renderedSections.length - 1].replace(/\s+$/, "")}${eol}`;
     }
   }
 
@@ -1680,6 +2385,7 @@ function formatBoundedHandoff(
   {
     maxDecisions = 15,
     maxGotchas = 15,
+    maxOpenQuestions = 15,
     maxStatusBullets = 15,
     header = `# Handoff (${handoffPath})`,
     intro = null,
@@ -1704,6 +2410,9 @@ function formatBoundedHandoff(
       s.norm === "gotchas / constraints" ||
       s.norm === "gotchas/constraints" ||
       s.norm === "gotchas",
+  );
+  const openQuestionsSec = sections.find(
+    (s) => s.norm === "open questions" || s.norm === "open question",
   );
   const commandsSec = sections.find((s) => s.norm === "commands");
 
@@ -1759,6 +2468,18 @@ function formatBoundedHandoff(
     parts.push("", gotchasBlock);
   }
 
+  if (openQuestionsSec) {
+    const openQuestionsBlock = formatRollingWindowSection(
+      "## Open questions",
+      content.slice(openQuestionsSec.start, openQuestionsSec.end),
+      handoffPath,
+      maxOpenQuestions,
+    );
+    if (openQuestionsBlock) {
+      parts.push("", openQuestionsBlock);
+    }
+  }
+
   if (commandsSec) {
     const cleanedCommands = stripHtmlComments(
       content.slice(commandsSec.start, commandsSec.end),
@@ -1782,12 +2503,14 @@ export function buildCompactSummaryFromHandoff(
 ) {
   const maxDecisions = clampInt(options.maxDecisions, 1, 1000, 15);
   const maxGotchas = clampInt(options.maxGotchas, 1, 1000, 15);
+  const maxOpenQuestions = clampInt(options.maxOpenQuestions, 1, 1000, 15);
   const maxStatusBullets = clampInt(options.maxStatusBullets, 1, 1000, 15);
   const resolvedPath = handoffPath || "HANDOFF.md";
 
   const formatted = formatBoundedHandoff(resolvedPath, handoffContent, {
     maxDecisions,
     maxGotchas,
+    maxOpenQuestions,
     maxStatusBullets,
     header: "# Handoff & Compaction Summary (from HANDOFF.md)",
     intro: `The project's \`HANDOFF.md\` (${resolvedPath}) was automatically updated before compaction and serves as the authoritative continuation state:`,
@@ -1824,6 +2547,7 @@ export function extractStartupContext(cwd) {
   return formatBoundedHandoff(handoffPath, content, {
     maxDecisions: 10,
     maxGotchas: 15,
+    maxOpenQuestions: 15,
     maxStatusBullets: 15,
     header: `# Handoff (${handoffPath})`,
     intro: null,
@@ -1873,6 +2597,91 @@ function extractCurrentStatusFromMarkdown(existingHandoff) {
   return out;
 }
 
+function extractOpenQuestionsFromMarkdown(existingHandoff) {
+  const sections = scanH2Sections(existingHandoff || "");
+  const sec = sections.find(
+    (s) => s.norm === "open questions" || s.norm === "open question",
+  );
+  if (!sec) return [];
+  return extractExistingBullets(existingHandoff.slice(sec.start, sec.end));
+}
+
+function parseTranscriptTurns(transcriptText) {
+  if (!transcriptText || typeof transcriptText !== "string") return [];
+  const trimmed = transcriptText.trim();
+  if (!trimmed) return [];
+
+  const chunks = trimmed
+    .split(/\n\n(?=\[[a-z0-9_-]+\]:)/i)
+    .map((c) => c.trim())
+    .filter(Boolean);
+
+  const turns = [];
+  for (const chunk of chunks) {
+    const m = chunk.match(/^\[([a-z0-9_-]+)\]:\s*([\s\S]*)$/i);
+    if (m) {
+      turns.push({
+        role: m[1].toLowerCase() === "model" ? "assistant" : m[1].toLowerCase(),
+        body: m[2].trim(),
+      });
+    } else {
+      turns.push({ role: "entry", body: chunk });
+    }
+  }
+  return turns;
+}
+
+function isIgnorableTranscriptLine(line) {
+  if (!line) return true;
+  if (/^\.{3}\s*\[/.test(line)) return true;
+  if (/^\[(?:files touched|code block omitted|truncated)/i.test(line)) return true;
+  if (/^(?:`{3,}|~{3,})/.test(line)) return true;
+  if (/^[-*_]{3,}$/.test(line)) return true;
+  return false;
+}
+
+function extractFirstMeaningfulLine(body) {
+  if (!body) return "";
+  for (const rawLine of body.replace(/\r\n/g, "\n").split("\n")) {
+    const line = rawLine.trim().replace(/^#+\s+/, "").replace(/^[-*+]\s+/, "").trim();
+    if (!line || isIgnorableTranscriptLine(line)) continue;
+    return line;
+  }
+  return "";
+}
+
+function extractDiscussionQuestions(turns) {
+  const questions = [];
+  // Scan from most recent turns backward (focusing on tail discussion)
+  const recentTurns = turns.slice(-8);
+  for (let i = recentTurns.length - 1; i >= 0; i--) {
+    const turn = recentTurns[i];
+    if (turn.role !== "assistant" && turn.role !== "user") continue;
+    let inFence = false;
+    const lines = turn.body.replace(/\r\n/g, "\n").split("\n");
+    for (let j = lines.length - 1; j >= 0; j--) {
+      const trimmed = lines[j].trim();
+      if (/^(?:`{3,}|~{3,})/.test(trimmed)) {
+        inFence = !inFence;
+        continue;
+      }
+      if (inFence || isIgnorableTranscriptLine(trimmed)) continue;
+      if (!/[?？]\s*$/.test(trimmed)) continue;
+      const cleaned = trimmed
+        .replace(/^(?:[-*+]|\d+\.)\s+/, "")
+        .replace(/^#+\s+/, "")
+        .replace(/\*\*/g, "")
+        .trim();
+      if (cleaned.length < 8 || /^https?:\/\//i.test(cleaned)) continue;
+      if (!questions.some((q) => similarBullets(q, cleaned))) {
+        questions.push(cleaned.slice(0, 200));
+      }
+      if (questions.length >= 5) return questions;
+    }
+  }
+  return questions;
+}
+
 function buildDeterministicResult({
   existingHandoff = "",
   gitContext = null,
@@ -1881,6 +2690,15 @@ function buildDeterministicResult({
   const prev = extractCurrentStatusFromMarkdown(existingHandoff);
   const done = [...prev.done];
   const inProgress = [];
+  const isDiscussionMode = detectDiscussionMode(gitContext);
+  const turns = parseTranscriptTurns(transcriptText);
+  const userTopics = turns
+    .filter((t) => t.role === "user")
+    .map((t) => extractFirstMeaningfulLine(t.body))
+    .filter(Boolean);
+  const firstUserTopic = userTopics[0] || "";
+  const latestUserTopic = userTopics[userTopics.length - 1] || "";
+  const questionCandidates = extractDiscussionQuestions(turns);
 
   const commitsRaw =
     gitContext?.commitsSinceLastCapture || gitContext?.recentCommits || "";
@@ -1909,20 +2727,43 @@ function buildDeterministicResult({
     inProgress.push(
       `Uncommitted changes in ${sampleFiles.join(", ")}${suffix}`,
     );
+  } else if (isDiscussionMode && userTopics.length > 0) {
+    const topicSummary =
+      firstUserTopic && latestUserTopic && !similarBullets(firstUserTopic, latestUserTopic)
+        ? `Discussion: ${firstUserTopic.slice(0, 80)} (latest: ${latestUserTopic.slice(0, 80)})`
+        : `Discussion: ${(latestUserTopic || firstUserTopic).slice(0, 140)}`;
+    inProgress.push(topicSummary);
+    for (const item of prev.in_progress) {
+      if (!inProgress.some((p) => similarBullets(p, item))) {
+        inProgress.push(item);
+      }
+    }
   } else if (prev.in_progress.length > 0) {
     inProgress.push(...prev.in_progress);
   }
 
   let next = prev.next || "";
-  if (!next) {
-    if (inProgress.length > 0 && statusLines.length > 0) {
+  if (inProgress.length > 0 && statusLines.length > 0) {
+    if (!next) {
       next = `Verify and complete work in ${statusLines[0].replace(/^\S+\s+/, "")}`;
+    }
+  } else if (isDiscussionMode && transcriptText && transcriptText.trim()) {
+    if (questionCandidates.length > 0) {
+      next = `Resolve open question and confirm next step: ${questionCandidates[0].slice(0, 140)}`;
+    } else if (latestUserTopic) {
+      next = `Continue discussion or execute next step for: ${latestUserTopic.slice(0, 140)}`;
+    } else if (!next) {
+      next = "Review HANDOFF.md and continue next planned task";
+    }
+  } else if (!next) {
+    if (latestUserTopic) {
+      next = `Continue from latest session context: ${latestUserTopic.slice(0, 140)}`;
     } else if (transcriptText && transcriptText.trim()) {
       const lastLine = transcriptText
         .trim()
         .split(/\r?\n/)
         .map((l) => l.trim())
-        .filter(Boolean)
+        .filter((l) => l && !isIgnorableTranscriptLine(l))
         .pop();
       next = lastLine
         ? `Continue from latest session context: ${lastLine.slice(0, 120)}`
@@ -1932,6 +2773,13 @@ function buildDeterministicResult({
     }
   }
 
+  const openQuestions =
+    questionCandidates.length > 0
+      ? questionCandidates
+      : !transcriptText || !transcriptText.trim()
+        ? extractOpenQuestionsFromMarkdown(existingHandoff)
+        : [];
+
   return {
     current_status: {
       done: done.slice(-12),
@@ -1940,6 +2788,7 @@ function buildDeterministicResult({
     },
     new_decisions: [],
     new_gotchas: [],
+    open_questions: openQuestions.slice(0, 8),
   };
 }
 
@@ -2075,6 +2924,7 @@ export async function runStandaloneCapture({
   trigger = "manual",
   agentName = "standalone",
   transcriptText = "",
+  transcriptEntries = null,
   llmRunner = undefined,
   skipIfUnchanged = false,
   config: configOverride = null,
@@ -2086,11 +2936,15 @@ export async function runStandaloneCapture({
   const prevState = readCaptureState(targetDir);
   const currentSignal = computeGitSignal(targetDir);
 
+  const hasRawTranscript =
+    (typeof transcriptText === "string" && Boolean(transcriptText.trim())) ||
+    (Array.isArray(transcriptEntries) && transcriptEntries.length > 0);
+
   if (
     skipIfUnchanged &&
     currentSignal &&
     prevState?.lastSignal === currentSignal &&
-    (!transcriptText || !transcriptText.trim())
+    !hasRawTranscript
   ) {
     return {
       skipped: true,
@@ -2104,10 +2958,35 @@ export async function runStandaloneCapture({
 
   const existingHandoff = fs.readFileSync(handoffPath, "utf8");
   const gitContext = gatherGitContext(targetDir, prevState?.lastHead || null);
+  const transcriptBudget = calculateTranscriptBudget(gitContext);
+  const distilledFromEntries =
+    Array.isArray(transcriptEntries) && transcriptEntries.length > 0
+      ? distillTranscriptEntries(transcriptEntries, transcriptBudget)
+      : "";
+  const effectiveTranscriptText =
+    distilledFromEntries ||
+    (typeof transcriptText === "string" ? transcriptText : "");
+
+  if (
+    skipIfUnchanged &&
+    currentSignal &&
+    prevState?.lastSignal === currentSignal &&
+    !effectiveTranscriptText.trim()
+  ) {
+    return {
+      skipped: true,
+      handoffPath,
+      statePath,
+      signal: currentSignal,
+      head: prevState?.lastHead || null,
+      usedFallback: false,
+    };
+  }
+
   const prompt = buildCapturePrompt({
     existingHandoff,
     gitContext,
-    transcriptText,
+    transcriptText: effectiveTranscriptText,
     agentName,
   });
 
@@ -2143,7 +3022,11 @@ export async function runStandaloneCapture({
     usedFallback = true;
     parsedResult = parseLLMResult(
       JSON.stringify(
-        buildDeterministicResult({ existingHandoff, gitContext, transcriptText }),
+        buildDeterministicResult({
+          existingHandoff,
+          gitContext,
+          transcriptText: effectiveTranscriptText,
+        }),
       ),
     );
   }
