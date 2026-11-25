@@ -28,6 +28,7 @@ const PATH_KEYS = new Set([
 ]);
 
 let cachedCorePromise: Promise<any> | null = null;
+let cachedCore: any = null;
 
 export function resolveHandoffCorePath(): string {
   const candidates: string[] = [];
@@ -92,7 +93,10 @@ export function resolveHandoffCorePath(): string {
 function getCore(): Promise<any> {
   if (!cachedCorePromise) {
     const corePath = resolveHandoffCorePath();
-    cachedCorePromise = import(pathToFileURL(corePath).href);
+    cachedCorePromise = import(pathToFileURL(corePath).href).then((mod) => {
+      cachedCore = mod;
+      return mod;
+    });
   }
   return cachedCorePromise;
 }
@@ -296,6 +300,9 @@ export function extractBoundedTranscript(
 ): string {
   if (!Array.isArray(entries) || entries.length === 0 || maxBytes <= 0) {
     return "";
+  }
+  if (typeof cachedCore?.distillTranscriptEntries === "function") {
+    return cachedCore.distillTranscriptEntries(entries, maxBytes);
   }
 
   const formatted: string[] = [];
@@ -731,10 +738,6 @@ export default function (pi: ExtensionAPI): void {
               ? event.branchEntries
               : [];
 
-        const transcriptText = extractBoundedTranscript(
-          rawSource,
-          TRANSCRIPT_HEAD_BUDGET_BYTES,
-        );
         const trigger =
           typeof event?.reason === "string" && event.reason.trim()
             ? event.reason.trim()
@@ -746,7 +749,7 @@ export default function (pi: ExtensionAPI): void {
           cwd: targetDir,
           trigger,
           agentName: "pi",
-          transcriptText,
+          transcriptEntries: rawSource,
           llmRunner,
           config,
         });
@@ -800,17 +803,13 @@ export default function (pi: ExtensionAPI): void {
           : typeof ctx?.sessionManager?.getEntries === "function"
             ? ctx.sessionManager.getEntries()
             : [];
-      const transcriptText = extractBoundedTranscript(
-        branchEntries,
-        TRANSCRIPT_HEAD_BUDGET_BYTES,
-      );
       const llmRunner = createPiLlmRunner(ctx, config);
 
       await runStandaloneCapture({
         cwd: targetDir,
         trigger: "session-end",
         agentName: "pi",
-        transcriptText,
+        transcriptEntries: Array.isArray(branchEntries) ? branchEntries : [],
         llmRunner,
         config,
       });

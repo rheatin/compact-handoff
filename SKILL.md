@@ -17,8 +17,24 @@ Unified configuration lives at `~/.config/handoff/config.json`, the canonical te
 ## Automatic Pre-Compaction & Lifecycle Behavior
 
 - **Pre-compaction trigger**: By default (`50%` of context window, or the configured token threshold in `~/.config/handoff/config.json`), `HANDOFF.md` in the project root is automatically updated at turn boundaries right before compaction (with an `85%` emergency safety cap mid-turn) and used as the compaction summary so in-flight state, decisions, and dead ends survive context resets.
-- **Startup injection**: When a new session starts in a workspace with an active `HANDOFF.md` (`> Last updated` != `never`), `compact-handoff context` surfaces a bounded rolling window of `> Last updated`, `## Overview`, `## Current status`, `## Decision log`, `## Gotchas / constraints`, and `## Commands`.
+- **Dual-mode capture & dynamic transcript budget**:
+  - **Code & implementation mode**: When uncommitted or newly committed git diffs exist, `handoff-core` uses a 45 KB fair-share diff budget and dynamically allocates `57 KB - diffBytes` (at least **12 KB**) for the distilled transcript.
+  - **Pure discussion / planning mode**: When `git diff` is empty (design, architecture, or research sessions), the transcript budget expands up to **48 KB** and applies user-intent-first distillation—preserving the initial goal, all user turns across the session, headings/decisions/questions, and touched file paths while stripping code blocks longer than 8 lines.
+- **Startup injection**: When a new session starts in a workspace with an active `HANDOFF.md` (`> Last updated` != `never`), `compact-handoff context` surfaces a bounded rolling window of `> Last updated`, `## Overview`, `## Current status`, `## Decision log`, `## Gotchas / constraints`, `## Open questions` (when unresolved items exist), and `## Commands`.
 - **Clean git working tree**: `HANDOFF.md`, `.claude/handoff.state.json`, `.opencode/handoff.state.json`, and `.gemini/handoff.state.json` are automatically added to `<git-dir>/info/exclude` (when `autoExcludeGit: true`), never dirtying tracked `.gitignore`. Capture metadata is stored in `<git-dir>/info/handoff.state.json`.
+
+## Plan & Alignment Checkpoints
+
+When a long design, architecture, or research discussion reaches key conclusions—or before transitioning from planning to implementation across hosts (`opencode`, `pi`, `claude-code`, `gemini-cli`)—create a handoff checkpoint even if no files have been edited yet:
+
+- **When to checkpoint**: After agreeing on an architectural plan, resolving major tradeoffs, completing codebase research (`path:line` findings), or before handing off to another host/session to execute.
+- **How to capture**: Run `/handoff` (or `compact-handoff capture --trigger manual --agent <name>`). Because `git diff` is empty, `compact-handoff` automatically enters Discussion Mode with up to a **48 KB** distilled transcript budget.
+- **What to record**:
+  - `**Done**`: Settled conclusions, researched modules with `path:line` or symbol references, and aligned design choices.
+  - `**In progress**`: Topics still being evaluated or refined.
+  - `**Next**`: The agreed next alignment decision or the first concrete implementation step.
+  - `## Decision log`: All agreed design choices and rejected alternatives (`Chose X over Y because Z`).
+  - `## Open questions`: Unresolved tradeoffs or items awaiting user confirmation (cleared once settled).
 
 ## Manual `/handoff` Workflows
 
@@ -29,12 +45,13 @@ When invoked to save or hand off the current session:
 
 1. **Initialize & exclude**: Run `compact-handoff init` (or `node scripts/cli.mjs init`) in the project root. This creates `<project-root>/HANDOFF.md` from `templates/HANDOFF.md` if absent and configures `<git-dir>/info/exclude`.
 2. **Read existing `HANDOFF.md` & git state**: Read `<project-root>/HANDOFF.md`, `git status --short`, and `git log --oneline -n 5`.
-3. **Update the 5 canonical sections surgically**:
+3. **Update the canonical sections surgically**:
    - Header: Update `> Last updated: <ISO-8601 timestamp> (via <agent-name> · manual)` where `<agent-name>` identifies your runtime (`opencode`, `pi`, `claude-code`, or `gemini-cli`).
    - `## Overview`: Preserve existing content byte-for-byte. Only populate it (1–2 concise sentences) if it is still empty/comment-only.
    - `## Current status`: Regenerate `**Done**`, `**In progress**`, and `**Next**` with concise, path-specific bullets. If the user passed arguments describing what the next session will focus on, tailor `**Next**` accordingly.
    - `## Decision log`: Append-only, prefixed with `- YYYY-MM-DD: <decision + rationale + rejected alternatives>`. Deduplicate against existing entries; never delete prior decisions.
    - `## Gotchas / constraints`: Append-only non-obvious traps, environment quirks, failed approaches, and dead ends ("Tried X, failed because Y"). Deduplicate against existing entries.
+   - `## Open questions`: Regenerate on each capture as a current snapshot of unresolved questions, open tradeoffs, or items awaiting user confirmation (use `- (none)` once all items are resolved).
    - `## Commands`: Preserve existing content byte-for-byte (only populate verified build/test/lint commands if currently empty/comment-only). Preserve any custom `##` sections verbatim.
 4. **Language & secret safety**:
    - Preserve the human language used in the conversation / existing `HANDOFF.md`.

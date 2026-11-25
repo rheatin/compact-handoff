@@ -26,6 +26,7 @@ type ModelRef = {
 }
 
 let cachedCorePromise: Promise<any> | null = null
+let cachedCore: any = null
 
 export function resolveHandoffCorePath(): string {
   const candidates: string[] = []
@@ -65,7 +66,10 @@ export function resolveHandoffCorePath(): string {
 function getCore(): Promise<any> {
   if (!cachedCorePromise) {
     const corePath = resolveHandoffCorePath()
-    cachedCorePromise = import(pathToFileURL(corePath).href)
+    cachedCorePromise = import(pathToFileURL(corePath).href).then((mod) => {
+      cachedCore = mod
+      return mod
+    })
   }
   return cachedCorePromise
 }
@@ -436,6 +440,9 @@ export function extractBoundedTranscript(
   maxBytes = TRANSCRIPT_HEAD_BUDGET_BYTES,
 ): string {
   if (!Array.isArray(head) || head.length === 0 || maxBytes <= 0) return ""
+  if (typeof cachedCore?.distillTranscriptEntries === "function") {
+    return cachedCore.distillTranscriptEntries(head, maxBytes)
+  }
 
   const formatted: string[] = []
   for (const item of head) {
@@ -935,10 +942,7 @@ const HandoffOpenCodeExtension = {
 
           try {
             const config = loadConfig()
-            const transcriptText = extractBoundedTranscript(
-              input?.head,
-              TRANSCRIPT_HEAD_BUDGET_BYTES,
-            )
+            const transcriptEntries = Array.isArray(input?.head) ? input.head : []
             const knownModel =
               (sessionID ? sessionModels.get(sessionID) : undefined) ??
               input?.model ??
@@ -960,7 +964,7 @@ const HandoffOpenCodeExtension = {
               cwd: targetDir,
               trigger,
               agentName: "opencode",
-              transcriptText,
+              transcriptEntries,
               llmRunner,
               config,
             })
@@ -1042,10 +1046,17 @@ const HandoffOpenCodeExtension = {
             config,
           )
 
+          const transcriptEntries = Array.isArray(input?.head)
+            ? input.head
+            : Array.isArray(input?.messages)
+              ? input.messages
+              : []
+
           await runStandaloneCapture({
             cwd: targetDir,
             trigger: "session-end",
             agentName: "opencode",
+            transcriptEntries,
             llmRunner,
             config,
           })
