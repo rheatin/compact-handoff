@@ -25,28 +25,33 @@
          │        │
          │        ▼
          │   [Pre-Compaction Capture]
-         │     • Bounded transcript (<= 12 KB) + fair-share git diff (<= 45 KB)
+         │     • Dynamic transcript budget: 12 KB (with 45 KB git diff) up to
+         │       48 KB (when git diff is empty in pure design/planning sessions)
+         │     • User-intent-first distillation (strips >8-line code blocks,
+         │       keeps initial goal, all user turns, conclusions & questions)
          │     • Secret path omission + inline token/key redaction
-         │     • Active LLM JSON extractor (with deterministic git fallback)
+         │     • Dual-mode LLM JSON extractor (Code Mode + Discussion Mode,
+         │       with discussion-aware deterministic fallback)
          │        │
          │        ▼
          │   [Surgical HANDOFF.md Update]
          │     • Preserves Overview, Commands & custom ## sections verbatim
-         │     • Regenerates Current status (Done / In progress / Next)
+         │     • Regenerates Current status (Done / In progress / Next) &
+         │       Open questions snapshot
          │     • Appends & deduplicates dated Decision log + Gotchas (EN + CJK)
          │        │
          │        ▼
          │   [Compaction Replacement]
          │     • Replaces generic compaction prose with buildCompactSummaryFromHandoff()
-         │     • Rolling window (latest 15 Done / Decisions / Gotchas) in prompt;
-         │       100% full history preserved on disk in HANDOFF.md
+         │     • Rolling window (latest 15 Done / Decisions / Gotchas / Open questions)
+         │       in prompt; 100% full history preserved on disk in HANDOFF.md
          │
          └── New Session / Resume in Any Host
                   │
                   ▼
              [Rolling-Window Startup Injection]
                • Injects Overview, Current status, latest 10 Decisions,
-                 latest 15 Gotchas, and Commands once on first turn
+                 latest 15 Gotchas, Open questions, and Commands on first turn
 ```
 
 ---
@@ -174,6 +179,10 @@ Lightweight HTTP/WebSocket session broker written in TypeScript.
 
 - Node `execFileSync` throws `ETIMEDOUT` if stdout exceeds `maxBuffer`; keep diff captures bounded.
 
+## Open questions
+
+- Confirm whether sliding-window TTL should reset on WebSocket reconnect.
+
 ## Commands
 
 - `npm test`
@@ -183,12 +192,13 @@ Lightweight HTTP/WebSocket session broker written in TypeScript.
 
 ## Design Principles
 
-1. **Surgical Markdown Updates**: `## Overview`, `## Commands`, and any custom `##` sections are preserved byte-for-byte. Only `> Last updated`, `## Current status`, and append-only deltas in `## Decision log` / `## Gotchas / constraints` are updated.
-2. **Bilingual Deduplication**: Jaccard/overlap similarity matching with CJK bigram tokenization prevents duplicate decisions and gotchas across repeated compactions in both English and CJK conversations.
-3. **45 KB Fair-Share Diff Budget + Secret Redaction**: Water-filling allocation ensures small changed files aren't starved by a single large generated file, while `.env*`, keys, certificates, and inline API tokens/Bearer headers are omitted or redacted.
-4. **Clean Git Working Trees**: Automatically adds `HANDOFF.md` and state files to `.git/info/exclude` (including worktree `git-common-dir`) so tracked `.gitignore` files are never dirtied.
-5. **Deterministic Fallback & Backoff**: If an LLM runner fails, times out (15s), or is unavailable (3-minute cooldown backoff), `runStandaloneCapture` seamlessly falls back to deterministic git status/commit extraction so compaction never stalls.
-6. **Zero Runtime Dependencies**: Pure Node.js (`>= 18`) ESM core with zero `npm` runtime dependencies.
+1. **Dual-Mode Support (Code Changes + Pure Design/Planning Discussions)**: Within a 57 KB combined evidence budget, the transcript budget scales dynamically from **12 KB** (when the 45 KB git diff budget is full) up to **48 KB** when `git diff` is empty. User-intent-first distillation strips code blocks longer than 8 lines, collapses verbose prose, and preserves the initial goal, all user turns, headings/conclusions, touched file paths, and `## Open questions`.
+2. **Surgical Markdown Updates**: `## Overview`, `## Commands`, and any custom `##` sections are preserved byte-for-byte. Only `> Last updated`, `## Current status`, the regenerated `## Open questions` snapshot, and append-only deltas in `## Decision log` / `## Gotchas / constraints` are updated.
+3. **Bilingual Deduplication**: Jaccard/overlap similarity matching with CJK bigram tokenization prevents duplicate decisions and gotchas across repeated compactions in both English and CJK conversations.
+4. **45 KB Fair-Share Diff Budget + Secret Redaction**: Water-filling allocation ensures small changed files aren't starved by a single large generated file, while `.env*`, keys, certificates, and inline API tokens/Bearer headers are omitted or redacted.
+5. **Clean Git Working Trees**: Automatically adds `HANDOFF.md` and state files to `.git/info/exclude` (including worktree `git-common-dir`) so tracked `.gitignore` files are never dirtied.
+6. **Deterministic Fallback & Backoff**: If an LLM runner fails, times out (15s), or is unavailable (3-minute cooldown backoff), `runStandaloneCapture` seamlessly falls back to deterministic git + discussion-topic/open-question extraction so compaction never stalls.
+7. **Zero Runtime Dependencies**: Pure Node.js (`>= 18`) ESM core with zero `npm` runtime dependencies.
 
 ---
 

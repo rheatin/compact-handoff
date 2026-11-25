@@ -25,27 +25,33 @@
          │        │
          │        ▼
          │   [压缩前捕获 (Pre-Compaction Capture)]
-         │     • 有界对话摘录 (<= 12 KB) + 公平分配 Git Diff (<= 45 KB)
+         │     • 动态对话预算：满 45 KB Git Diff 时保底 12 KB；无 Diff 的纯讨论
+         │       规划场景下自动扩展至最高 48 KB
+         │     • 用户意图优先蒸馏：剥离超过 8 行的代码块，保留初始目标、全部用户
+         │       轮次、结论标题与待确认问题
          │     • 自动跳过敏感路径并脱敏内联 Token / 密钥
-         │     • 当前会话模型 JSON 提取器（失败时自动降级为确定性 Git 提取）
+         │     • 双模式 JSON 提取器（代码实现模式 + 设计讨论模式，失败时自动降级
+         │       为支持讨论提取的确定性回退）
          │        │
          │        ▼
          │   [外科手术式更新 HANDOFF.md]
          │     • 原样保留 Overview、Commands 与所有自定义 ## 章节
-         │     • 重新生成 Current status (Done / In progress / Next)
+         │     • 重新生成 Current status (Done / In progress / Next) 与
+         │       Open questions 当前快照
          │     • 追加并去重带日期的 Decision log 与 Gotchas（支持英文 + 中日韩双语）
          │        │
          │        ▼
          │   [压缩摘要替换 (Compaction Replacement)]
          │     • 用 buildCompactSummaryFromHandoff() 替换通用压缩摘要
-         │     • 提示词仅注入最近 15 条滚动窗口；磁盘 HANDOFF.md 保留 100% 完整历史
+         │     • 提示词仅注入最近 15 条滚动窗口（含 Open questions）；
+         │       磁盘 HANDOFF.md 保留 100% 完整历史
          │
          └── 在任意宿主中开启新会话 / 继续任务
                   │
                   ▼
              [启动时滚动窗口注入]
                • 仅在首轮注入 Overview、Current status、最近 10 条 Decision、
-                 最近 15 条 Gotchas 与 Commands
+                 最近 15 条 Gotchas、Open questions 与 Commands
 ```
 
 ---
@@ -143,14 +149,56 @@ compact-handoff hook <claude|gemini> <precompact|sessionstart|sessionend|stop>
 
 ---
 
+## 标准 `HANDOFF.md` 结构
+
+```markdown
+# Handoff
+
+> Last updated: 2026-11-25T15:30:00.000Z (via opencode · auto)
+
+## Overview
+
+Lightweight HTTP/WebSocket session broker written in TypeScript.
+
+## Current status
+
+**Done**
+- Added JWT refresh rotation in `src/auth/tokens.ts`
+
+**In progress**
+- Wiring rate-limiter middleware in `src/middleware/rate-limit.ts`
+
+**Next**
+- Add integration tests for concurrent refresh bursts in `tests/auth.test.mjs`
+
+## Decision log
+
+- 2026-11-25: Store session state in SQLite WAL mode instead of Redis to avoid extra local infra.
+
+## Gotchas / constraints
+
+- Node `execFileSync` throws `ETIMEDOUT` if stdout exceeds `maxBuffer`; keep diff captures bounded.
+
+## Open questions
+
+- Confirm whether sliding-window TTL should reset on WebSocket reconnect.
+
+## Commands
+
+- `npm test`
+```
+
+---
+
 ## 核心设计原则
 
-1. **外科手术式 Markdown 更新**：`## Overview`、`## Commands` 及自定义 `##` 章节逐字节原样保留，仅刷新 `> Last updated`、`## Current status`，并在 `## Decision log` 与 `## Gotchas / constraints` 中仅做去重追加。
-2. **中英双语去重**：结合英文词元 Jaccard 相似度与 CJK 二元语法（bigram）分词，避免多次压缩后产生重复决策与重复踩坑记录。
-3. **45 KB 公平 Diff 预算与密钥脱敏**：采用注水算法（water-filling）分配各文件 Diff 额度，防止单个大型生成文件挤占小文件上下文；自动跳过 `.env*`、密钥/证书文件并脱敏内联 Token。
-4. **不污染 Git 工作区**：自动将 `HANDOFF.md` 与状态文件写入 `.git/info/exclude`（兼容 git worktree 的 `git-common-dir`），绝不修改受版本控制的 `.gitignore`。
-5. **确定性降级与冷却退避**：当 LLM 调用失败、超时（15 秒）或处于 3 分钟冷却期时，`runStandaloneCapture` 会自动回退到基于 Git 状态与提交记录的确定性提取，确保压缩流程永不阻塞。
-6. **零运行时依赖**：纯 Node.js（`>= 18`）ESM 核心实现，无任何第三方 `npm` 运行时依赖。
+1. **双模式支持（代码变更 + 纯设计/规划讨论）**：在 57 KB 联合证据预算内，当 45 KB Git Diff 满额时保留 12 KB 对话底线；当 `git diff` 为空（纯设计/规划/调研讨论）时，对话预算自动扩展至 **48 KB**，并通过用户意图优先蒸馏剥离超过 8 行的代码块、折叠冗长散文，完整保留初始目标、所有用户轮次、结论与 `## Open questions`。
+2. **外科手术式 Markdown 更新**：`## Overview`、`## Commands` 及自定义 `##` 章节逐字节原样保留，仅刷新 `> Last updated`、`## Current status` 与 `## Open questions` 当前快照，并在 `## Decision log` 与 `## Gotchas / constraints` 中仅做去重追加。
+3. **中英双语去重**：结合英文词元 Jaccard 相似度与 CJK 二元语法（bigram）分词，避免多次压缩后产生重复决策与重复踩坑记录。
+4. **45 KB 公平 Diff 预算与密钥脱敏**：采用注水算法（water-filling）分配各文件 Diff 额度，防止单个大型生成文件挤占小文件上下文；自动跳过 `.env*`、密钥/证书文件并脱敏内联 Token。
+5. **不污染 Git 工作区**：自动将 `HANDOFF.md` 与状态文件写入 `.git/info/exclude`（兼容 git worktree 的 `git-common-dir`），绝不修改受版本控制的 `.gitignore`。
+6. **确定性降级与冷却退避**：当 LLM 调用失败、超时（15 秒）或处于 3 分钟冷却期时，`runStandaloneCapture` 会自动回退到基于 Git 状态与讨论主题/待确认问题的确定性提取，确保压缩流程永不阻塞。
+7. **零运行时依赖**：纯 Node.js（`>= 18`）ESM 核心实现，无任何第三方 `npm` 运行时依赖。
 
 ---
 
