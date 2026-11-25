@@ -1,0 +1,35 @@
+{
+  "name": "compact-handoff",
+  "version": "0.1.0",
+  "type": "module",
+  "description": "Pre-compaction HANDOFF.md generator and compaction replacement for coding agents (OpenCode, Pi, Claude Code, Gemini CLI)",
+  "license": "MIT",
+  "engines": {
+    "node": ">=18"
+  },
+  "bin": {
+    "compact-handoff": "scripts/cli.mjs"
+  },
+  "scripts": {
+    "test": "node --test tests/*.test.mjs",
+    "install:hosts": "node scripts/install.mjs"
+  },
+  "files": [
+    "SKILL.md",
+    "README.md",
+    "LICENSE",
+    "scripts/",
+    "templates/",
+    "extensions/"
+  ],
+  "keywords": [
+    "handoff",
+    "compaction",
+    "coding-agents",
+    "opencode",
+    "pi",
+    "claude-code",
+    "gemini-cli",
+    "context-window"
+  ]
+}
