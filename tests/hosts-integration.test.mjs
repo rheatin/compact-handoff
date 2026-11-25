@@ -947,3 +947,164 @@ test("buildCompactSummaryFromHandoff and extractStartupContext trim large histor
       ),
   );
 });
+
+test("Pi session_before_compact and CLI precompact hook support pure-discussion dynamic 48 KB distillation and Open questions", async (t) => {
+  const repoDir = createTempGitRepo("handoff-hosts-disc-");
+  const cfgDir = fs.mkdtempSync(path.join(os.tmpdir(), "handoff-hosts-disc-cfg-"));
+  const prevCfg = process.env.HANDOFF_CONFIG_PATH;
+  const prevDisable = process.env.HANDOFF_DISABLE_EXTERNAL_LLM;
+  process.env.HANDOFF_CONFIG_PATH = writeTempConfig(cfgDir);
+  process.env.HANDOFF_DISABLE_EXTERNAL_LLM = "1";
+
+  t.after(() => {
+    if (prevCfg === undefined) delete process.env.HANDOFF_CONFIG_PATH;
+    else process.env.HANDOFF_CONFIG_PATH = prevCfg;
+    if (prevDisable === undefined) delete process.env.HANDOFF_DISABLE_EXTERNAL_LLM;
+    else process.env.HANDOFF_DISABLE_EXTERNAL_LLM = prevDisable;
+    fs.rmSync(repoDir, { recursive: true, force: true });
+    fs.rmSync(cfgDir, { recursive: true, force: true });
+  });
+
+  // 1. Pi session_before_compact in clean repo uses >12 KB distilled transcript and surfaces open_questions
+  const seenPrompts = [];
+  const activeModel = { provider: "mock", id: "mock-pi-model", api: "mock" };
+  const modelRegistry = {
+    async getApiKey() {
+      return "test-pi-key";
+    },
+    async completeSimple(_model, llmContext) {
+      seenPrompts.push(llmContext.messages[0].content[0].text);
+      return {
+        content: [
+          {
+            type: "text",
+            text: JSON.stringify({
+              current_status: {
+                done: ["Researched state persistence architecture"],
+                in_progress: ["Evaluating migration steps"],
+                next: "Confirm schema version header format",
+              },
+              new_decisions: ["Keep HANDOFF.md surgical without altering Overview"],
+              new_gotchas: [],
+              open_questions: ["Should legacy v1 headers auto-migrate on read?"],
+            }),
+          },
+        ],
+      };
+    },
+  };
+
+  const longCode = [
+    "```js",
+    ...Array.from({ length: 12 }, (_, i) => `const item${i} = ${i};`),
+    "```",
+  ].join("\n");
+
+  const discussionMessages = [
+    { role: "user", content: "Plan pure-discussion continuity improvements" },
+    {
+      role: "assistant",
+      content: [
+        {
+          type: "text",
+          text: [
+            "### Findings",
+            longCode,
+            "- Should legacy v1 headers auto-migrate on read?",
+          ].join("\n"),
+        },
+      ],
+    },
+  ];
+  for (let i = 1; i <= 8; i++) {
+    discussionMessages.push({
+      role: "user",
+      content: `Also check CLI transcript distillation aspect #${i}`,
+    });
+    discussionMessages.push({
+      role: "assistant",
+      content: [
+        {
+          type: "text",
+          text: `- CLI notes #${i}: ${"cli streaming pipeline rationale ".repeat(75)}`,
+        },
+      ],
+    });
+  }
+
+  const harness = createMockPiHarness();
+  const compactRes = await harness.emit(
+    "session_before_compact",
+    {
+      type: "session_before_compact",
+      reason: "threshold",
+      willRetry: false,
+      branchEntries: [],
+      preparation: {
+        firstKeptEntryId: "keep_1",
+        tokensBefore: 90000,
+        turnPrefixMessages: [],
+        isSplitTurn: false,
+        messagesToSummarize: discussionMessages,
+      },
+    },
+    { cwd: repoDir, model: activeModel, modelRegistry },
+  );
+
+  assert.equal(seenPrompts.length, 1);
+  assert.match(seenPrompts[0], /Design \/ Planning \/ Research Discussion Mode/);
+  assert.match(seenPrompts[0], /\[code block omitted: js, 12 lines\]/);
+  assert.ok(Buffer.byteLength(seenPrompts[0], "utf8") > 16 * 1024);
+  assert.match(
+    compactRes.compaction.summary,
+    /Should legacy v1 headers auto-migrate on read\?/,
+  );
+
+  // 2. CLI claude precompact hook in clean repo distills JSONL transcript through distillTranscriptEntries(..., 48KB)
+  const cliRepoDir = createTempGitRepo("handoff-cli-disc-");
+  t.after(() => fs.rmSync(cliRepoDir, { recursive: true, force: true }));
+  const transcriptPath = path.join(cfgDir, "cli-discussion.jsonl");
+  fs.writeFileSync(
+    transcriptPath,
+    [
+      JSON.stringify({
+        type: "user",
+        message: { role: "user", content: "Design zero-downtime DB migration workflow" },
+      }),
+      JSON.stringify({
+        type: "assistant",
+        message: {
+          role: "assistant",
+          content: [
+            {
+              type: "text",
+              text: [
+                "### Expand-Contract Plan",
+                longCode,
+                "Should dual-write run synchronously or via outbox queue?",
+              ].join("\n"),
+            },
+          ],
+        },
+      }),
+    ].join("\n") + "\n",
+    "utf8",
+  );
+
+  const preCompactOut = runHookCli(
+    ["claude", "precompact"],
+    {
+      session_id: "claude_disc_1",
+      transcript_path: transcriptPath,
+      cwd: cliRepoDir,
+      hook_event_name: "PreCompact",
+      trigger: "auto",
+    },
+    { env: { HANDOFF_CONFIG_PATH: writeTempConfig(cfgDir, { captureOnSessionEnd: false }) } },
+  );
+  assert.equal(preCompactOut.json.continue, true);
+
+  const cliHandoff = fs.readFileSync(path.join(cliRepoDir, "HANDOFF.md"), "utf8");
+  assert.match(cliHandoff, /Design zero-downtime DB migration workflow/);
+  assert.match(cliHandoff, /Should dual-write run synchronously or via outbox queue\?/);
+});

@@ -749,3 +749,113 @@ test("createClientLlmRunner passes activeModel with useSubagent=true, aborts/del
   assert.equal(calls.prompt, 2)
   assert.ok(outBackoff.summary)
 })
+
+test("compaction.provide delegates transcriptEntries in pure-discussion mode with up-to-48KB budget and captures open_questions", async (t) => {
+  const repoDir = createTempGitRepo("handoff-oc-discussion-")
+  const cfgDir = fs.mkdtempSync(path.join(os.tmpdir(), "handoff-oc-disc-cfg-"))
+  const prevCfg = process.env.HANDOFF_CONFIG_PATH
+  process.env.HANDOFF_CONFIG_PATH = writeTempConfig(cfgDir, { useSubagent: false })
+
+  t.after(() => {
+    if (prevCfg === undefined) delete process.env.HANDOFF_CONFIG_PATH
+    else process.env.HANDOFF_CONFIG_PATH = prevCfg
+    fs.rmSync(repoDir, { recursive: true, force: true })
+    fs.rmSync(cfgDir, { recursive: true, force: true })
+  })
+
+  const promptedTexts = []
+  const mockClient = {
+    session: {
+      async create() {
+        return { data: { id: "ses_ephemeral_disc" } }
+      },
+      async prompt(opts) {
+        promptedTexts.push(opts.body.parts[0].text)
+        return {
+          data: {
+            parts: [
+              {
+                type: "text",
+                text: JSON.stringify({
+                  current_status: {
+                    done: ["Completed architecture discussion for sync protocol"],
+                    in_progress: ["Evaluating conflict resolution strategy"],
+                    next: "Confirm CRDT vs LWW preference before coding",
+                  },
+                  new_decisions: ["Use WebSocket binary frames for delta sync"],
+                  new_gotchas: [],
+                  open_questions: ["Should offline edits merge via CRDT or last-write-wins?"],
+                }),
+              },
+            ],
+          },
+        }
+      },
+      async delete() {
+        return { data: true }
+      },
+    },
+  }
+
+  const hooks = await HandoffExtension.server({ directory: repoDir, client: mockClient })
+  const longCode = [
+    "```ts",
+    ...Array.from({ length: 12 }, (_, i) => `const snippet${i} = ${i};`),
+    "```",
+  ].join("\n")
+
+  const discussionHead = [
+    {
+      info: { role: "user" },
+      parts: [{ type: "text", text: "Design the offline sync protocol before writing code" }],
+    },
+    {
+      info: { role: "assistant" },
+      parts: [
+        {
+          type: "text",
+          text: [
+            "### Sync Architecture",
+            longCode,
+            "- Should offline edits merge via CRDT or last-write-wins?",
+          ].join("\n"),
+        },
+      ],
+    },
+  ]
+  for (let i = 1; i <= 8; i++) {
+    discussionHead.push({
+      info: { role: "user" },
+      parts: [{ type: "text", text: `Compare payload overhead for sync scenario #${i}` }],
+    })
+    discussionHead.push({
+      info: { role: "assistant" },
+      parts: [
+        {
+          type: "text",
+          text: `- Payload comparison #${i}: ${"compact protobuf overhead analysis ".repeat(75)}`,
+        },
+      ],
+    })
+  }
+
+  const out = {}
+  await hooks["experimental.session.compaction.provide"](
+    { sessionID: "ses_disc_main", reason: "percentage", head: discussionHead },
+    out,
+  )
+
+  assert.equal(promptedTexts.length, 1)
+  assert.match(promptedTexts[0], /Design \/ Planning \/ Research Discussion Mode/)
+  assert.match(promptedTexts[0], /\[code block omitted: ts, 12 lines\]/)
+  // Clean git repo -> > 12 KB transcript is preserved within 48 KB budget
+  assert.ok(Buffer.byteLength(promptedTexts[0], "utf8") > 16 * 1024)
+
+  const handoffMd = fs.readFileSync(path.join(repoDir, "HANDOFF.md"), "utf8")
+  assert.match(handoffMd, /## Open questions/)
+  assert.match(handoffMd, /Should offline edits merge via CRDT or last-write-wins\?/)
+  assert.match(
+    out.summary.modelText,
+    /Should offline edits merge via CRDT or last-write-wins\?/,
+  )
+})
