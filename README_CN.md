@@ -10,7 +10,7 @@
 
 `compact-handoff` 帮助长时间运行的工程会话在触发上下文窗口上限或跨工具切换时，避免丢失架构决策、上下文动机与已踩过的坑。
 
-> **定位说明**：`compact-handoff` **不是**多 Agent 编排器或任务路由器。它不会派生 Agent 集群，而是维护单一、精确的 `<project-root>/HANDOFF.md` 状态文件，使其在上下文压缩后依然完整可用，并在 **OpenCode**、**Pi**、**Claude Code** 与 **Gemini CLI** 之间无缝接力。
+> **定位说明**：`compact-handoff` **不是**多 Agent 编排器或任务路由器。它不会派生 Agent 集群，而是维护单一、精确的 `<project-root>/HANDOFF.md` 状态文件，使其在上下文压缩后依然完整可用，并在 **OpenCode**、**Pi**、**Oh My Pi (`omp`)**、**Claude Code**、**Gemini CLI**、**GitHub Copilot CLI** 与 **Google Antigravity** 之间无缝接力。
 
 ---
 
@@ -62,8 +62,11 @@
 | :--- | :--- | :---: | :---: | :---: | :---: |
 | **OpenCode** | 插件 (`extensions/opencode/handoff.ts`) | ✅ Turn 边界 + 85% 上限 | ✅ `experimental.session.compaction.provide` | ✅ `chat.message` | ✅ 自动跳过子会话 |
 | **Pi (`pi`)** | 插件 (`extensions/pi/handoff.ts`) | ✅ `agent_end` + `turn_end` 85% 上限 | ✅ `session_before_compact` | ✅ `before_agent_start` | ✅ 跳过 `PI_SUBAGENT_CHILD` |
+| **Oh My Pi (`omp`)** | 插件 (`extensions/omp/handoff.ts`) | ✅ `session_before_compact` + `agent_end`/`turn_end` 上限 | ⚠️ 通过 `session.compacting` 注入 HANDOFF 窗口；压缩摘要仍由 omp 的 `/handoff` 拥有 | ✅ `before_agent_start` | ✅ 跳过 `ctx.agent.kind === "sub"` |
 | **Claude Code** | Hooks (`~/.claude/settings.json`) | ✅ `PreCompact` hook | ⚠️ `systemMessage` 提示 | ✅ `SessionStart` `additionalContext` | ✅ 递归守卫 |
 | **Gemini CLI** | Hooks (`~/.gemini/config/hooks.json`) | ✅ `PreCompact` + `Stop` 阈值 | ⚠️ 重置前 Hook 捕获 | ✅ `SessionStart` `additionalContext` | ✅ 递归守卫 |
+| **GitHub Copilot CLI** | Hooks (`~/.copilot/hooks/compact-handoff.json`) | ✅ `preCompact` hook | ⚠️ 仅提示（该 Hook 为通知型） | ✅ `sessionStart` `additionalContext` | ✅ 递归守卫 |
+| **Google Antigravity** | Hooks (`~/.gemini/config/hooks.json`) | ✅ `PreInvocation` + `Stop` 阈值 | ⚠️ 仅提示（重置前捕获） | ✅ `SessionStart` `injectSteps` | ✅ 递归守卫 |
 
 ---
 
@@ -77,27 +80,30 @@ npx skills add rheatin/compact-handoff
 
 ### 方式二：完整多宿主安装（推荐）
 
-克隆仓库并运行幂等安装脚本，自动配置 CLI（`~/.local/bin/compact-handoff`）、统一配置（`~/.config/handoff/config.json`）、Skill 目录、OpenCode / Pi 插件，以及 Claude Code / Gemini CLI Hooks：
+克隆仓库并运行幂等安装脚本，自动配置 CLI（`~/.local/bin/compact-handoff`）、统一配置（`~/.config/handoff/config.json`）、Skill 目录、OpenCode / Pi / omp 插件，以及 Claude Code / Gemini CLI / Copilot CLI / Antigravity Hooks：
 
 ```bash
 git clone https://github.com/rheatin/compact-handoff.git
 cd compact-handoff
 
-# 预览将执行的变更（不修改磁盘）
+# 预览所有变更，不写入磁盘
 node scripts/install.mjs --dry-run
 
 # 安装默认宿主（OpenCode, Pi, Claude Code）
 node scripts/install.mjs
 
-# 包含 Gemini CLI 并自定义触发阈值
-node scripts/install.mjs --hosts opencode,pi,claude,gemini --percentage 50
+# 安装全部受支持宿主并自定义阈值
+node scripts/install.mjs --hosts all --percentage 50
+
+# 仅安装本机正在使用的宿主
+node scripts/install.mjs --hosts omp,copilot,antigravity
 ```
 
 #### 常用安装选项
 
 ```bash
 node scripts/install.mjs [options]
-  --hosts <list>          opencode,pi,claude,gemini 或 "all"（默认：opencode,pi,claude）
+  --hosts <list>          opencode,pi,claude,gemini,omp,copilot,antigravity 或 "all"（默认：opencode,pi,claude）
   --opencode-dir <dir>    指定 OpenCode 配置目录（默认：$OPENCODE_CONFIG_DIR 或 ~/.config/opencode）
   --mode <mode>           percentage | tokens | auto
   --percentage <1-100>    上下文比例触发阈值（默认：50）
@@ -143,8 +149,8 @@ compact-handoff capture [--trigger auto|manual|session-end] [--agent <name>] [--
 compact-handoff context [dir]
 compact-handoff config --show
 compact-handoff config [--mode percentage|tokens|auto] [--percentage 50] [--tokens 100000] [--session-end on|off] [--subagent on|off] [--auto-exclude on|off] [--model current]
-compact-handoff install [--hosts opencode,pi,claude,gemini] [--dry-run] [--uninstall]
-compact-handoff hook <claude|gemini> <precompact|sessionstart|sessionend|stop>
+compact-handoff install [--hosts opencode,pi,claude,gemini,omp,copilot,antigravity] [--dry-run] [--uninstall]
+compact-handoff hook <claude|gemini|copilot|antigravity> <precompact|sessionstart|sessionend|preinvocation|stop>
 ```
 
 ---

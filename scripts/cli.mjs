@@ -26,8 +26,8 @@ Usage:
   compact-handoff capture [--trigger <auto|manual|session-end>] [--agent <name>] [--transcript <path>] [dir]
   compact-handoff context [dir]
   compact-handoff config [--mode percentage|tokens|auto] [--percentage <1-100>] [--tokens <N>] [--session-end on|off] [--subagent on|off] [--auto-exclude on|off] [--model <name>] [--show]
-  compact-handoff install [--hosts opencode,pi,claude,gemini] [--uninstall] [--dry-run] [--percentage <1-100>] [--tokens <N>]
-  compact-handoff hook <claude|gemini> <precompact|sessionstart|sessionend|stop>
+  compact-handoff install [--hosts opencode,pi,claude,gemini,omp,copilot,antigravity] [--uninstall] [--dry-run] [--percentage <1-100>] [--tokens <N>]
+  compact-handoff hook <claude|gemini|copilot|antigravity> <precompact|sessionstart|sessionend|preinvocation|stop>
 `);
 }
 
@@ -551,6 +551,47 @@ function doesGeminiMeetThreshold(payload, transcriptPath, transcriptText, config
   return false;
 }
 
+const HOOK_HOSTS = new Set(["claude", "gemini", "copilot", "antigravity"]);
+const HOOK_AGENT_NAMES = {
+  claude: "claude-code",
+  gemini: "gemini-cli",
+  copilot: "copilot-cli",
+  antigravity: "antigravity",
+};
+
+// Antigravity fires PreInvocation before every model call and Copilot can fire
+// preCompact repeatedly. Keep threshold-driven captures from rewriting the same
+// HANDOFF.md on every hook tick.
+const THRESHOLD_CAPTURE_COOLDOWN_MS = 120_000;
+
+function recentThresholdCapture(cwd) {
+  const state = readCaptureState(cwd);
+  if (!state?.lastCapturedAt) return false;
+  const capturedAt = Date.parse(state.lastCapturedAt);
+  return (
+    Number.isFinite(capturedAt) &&
+    Date.now() - capturedAt < THRESHOLD_CAPTURE_COOLDOWN_MS
+  );
+}
+
+function formatSessionStartOutput(host, context) {
+  if (!context) return {};
+  if (host === "copilot") {
+    return { additionalContext: context };
+  }
+  if (host === "antigravity") {
+    return {
+      injectSteps: [{ systemMessage: { systemMessage: context } }],
+    };
+  }
+  return {
+    hookSpecificOutput: {
+      hookEventName: "SessionStart",
+      additionalContext: context,
+    },
+  };
+}
+
 async function handleHook(hostRaw, eventRaw) {
   try {
     if (process.env.HANDOFF_CAPTURE_ACTIVE === "1") {
@@ -565,34 +606,30 @@ async function handleHook(hostRaw, eventRaw) {
       .trim()
       .toLowerCase();
 
-    if (!["claude", "gemini"].includes(host)) {
+    if (!HOOK_HOSTS.has(host)) {
       process.stdout.write("{}\n");
       process.exit(0);
     }
 
     const payload = await readStdinJson();
     const cwd = resolveHookWorkspaceDir(payload);
-    const agentName = host === "claude" ? "claude-code" : "gemini-cli";
+    const agentName = HOOK_AGENT_NAMES[host];
     const transcriptPath = resolveHookTranscriptPath(payload, cwd, host);
 
     if (event === "sessionstart") {
       const ctx = extractStartupContext(cwd);
-      if (ctx) {
-        process.stdout.write(
-          `${JSON.stringify({
-            hookSpecificOutput: {
-              hookEventName: "SessionStart",
-              additionalContext: ctx,
-            },
-          })}\n`,
-        );
-      } else {
-        process.stdout.write("{}\n");
-      }
+      process.stdout.write(
+        `${JSON.stringify(formatSessionStartOutput(host, ctx))}\n`,
+      );
       process.exit(0);
     }
 
     if (event === "precompact") {
+      if (host === "antigravity") {
+        process.stdout.write("{}\n");
+        process.exit(0);
+      }
+
       const transcriptText =
         extractTranscriptFromFile(transcriptPath) ||
         extractInlinePayloadTranscript(payload);
@@ -603,6 +640,12 @@ async function handleHook(hostRaw, eventRaw) {
         agentName,
         transcriptText,
       });
+
+      if (host === "copilot") {
+        process.stdout.write("{}\n");
+        process.exit(0);
+      }
+
       const ctx = extractStartupContext(cwd);
       const out = {
         continue: true,
@@ -612,6 +655,36 @@ async function handleHook(hostRaw, eventRaw) {
           : {}),
       };
       process.stdout.write(`${JSON.stringify(out)}\n`);
+      process.exit(0);
+    }
+
+    if (event === "preinvocation") {
+      if (host !== "antigravity") {
+        process.stdout.write("{}\n");
+        process.exit(0);
+      }
+
+      const config = loadConfig();
+      const transcriptText =
+        extractTranscriptFromFile(transcriptPath) ||
+        extractInlinePayloadTranscript(payload);
+      const thresholdMet = doesGeminiMeetThreshold(
+        payload,
+        transcriptPath,
+        transcriptText,
+        config,
+      );
+
+      if (thresholdMet && !recentThresholdCapture(cwd)) {
+        await runStandaloneCapture({
+          cwd,
+          trigger: "auto",
+          agentName,
+          transcriptText,
+          config,
+        });
+      }
+      process.stdout.write("{}\n");
       process.exit(0);
     }
 
@@ -625,8 +698,10 @@ async function handleHook(hostRaw, eventRaw) {
       const transcriptText =
         extractTranscriptFromFile(transcriptPath) ||
         extractInlinePayloadTranscript(payload);
+      const thresholdHost =
+        (host === "gemini" || host === "antigravity") && event === "stop";
 
-      if (host === "gemini" && event === "stop") {
+      if (thresholdHost) {
         const thresholdMet = doesGeminiMeetThreshold(
           payload,
           transcriptPath,
@@ -638,16 +713,22 @@ async function handleHook(hostRaw, eventRaw) {
           process.exit(0);
         }
 
-        await runStandaloneCapture({
-          cwd,
-          trigger: thresholdMet ? "auto" : "session-end",
-          agentName,
-          transcriptText,
-          skipIfUnchanged: !thresholdMet,
-          config,
-        });
+        if (!thresholdMet || !recentThresholdCapture(cwd)) {
+          await runStandaloneCapture({
+            cwd,
+            trigger: thresholdMet ? "auto" : "session-end",
+            agentName,
+            transcriptText,
+            skipIfUnchanged: !thresholdMet,
+            config,
+          });
+        }
         process.stdout.write(
-          `${JSON.stringify({ continue: true, suppressOutput: true })}\n`,
+          `${JSON.stringify(
+            host === "gemini"
+              ? { continue: true, suppressOutput: true }
+              : {},
+          )}\n`,
         );
         process.exit(0);
       }
@@ -665,7 +746,9 @@ async function handleHook(hostRaw, eventRaw) {
         config,
       });
       process.stdout.write(
-        `${JSON.stringify({ continue: true, suppressOutput: true })}\n`,
+        `${JSON.stringify(
+          host === "copilot" ? {} : { continue: true, suppressOutput: true },
+        )}\n`,
       );
       process.exit(0);
     }

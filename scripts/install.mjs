@@ -15,7 +15,24 @@ const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 const DEFAULT_REPO_ROOT = path.resolve(__dirname, "..");
 
-const VALID_HOSTS = new Set(["opencode", "pi", "claude", "gemini"]);
+const VALID_HOSTS = new Set([
+  "opencode",
+  "pi",
+  "claude",
+  "gemini",
+  "omp",
+  "copilot",
+  "antigravity",
+]);
+const ALL_HOSTS = [
+  "opencode",
+  "pi",
+  "claude",
+  "gemini",
+  "omp",
+  "copilot",
+  "antigravity",
+];
 const DEFAULT_HOSTS = ["opencode", "pi", "claude"];
 
 export function printInstallHelp() {
@@ -26,7 +43,8 @@ Usage:
   compact-handoff install [options]
 
 Options:
-  --hosts <list>          Comma-separated hosts: opencode,pi,claude,gemini or "all"
+  --hosts <list>          Comma-separated hosts:
+                          opencode,pi,claude,gemini,omp,copilot,antigravity or "all"
                           (default: opencode,pi,claude)
   --opencode-dir <dir>    Override OpenCode config directory (default: $OPENCODE_CONFIG_DIR or ~/.config/opencode)
   --mode <mode>           Trigger mode: percentage | tokens | auto
@@ -85,18 +103,25 @@ export function parseHostList(hostsArg) {
   }
   const raw = hostsArg.trim().toLowerCase();
   if (raw === "all") {
-    return ["opencode", "pi", "claude", "gemini"];
+    return [...ALL_HOSTS];
   }
   const list = raw
     .split(",")
     .map((h) => h.trim())
     .filter(Boolean);
+  const HOST_ALIASES = {
+    "claude-code": "claude",
+    "gemini-cli": "gemini",
+    "oh-my-pi": "omp",
+    "copilot-cli": "copilot",
+    "antigravity-ide": "antigravity",
+  };
   const mapped = [];
   for (const h of list) {
-    const norm = h === "claude-code" ? "claude" : h === "gemini-cli" ? "gemini" : h;
+    const norm = HOST_ALIASES[h] ?? h;
     if (!VALID_HOSTS.has(norm)) {
       throw new Error(
-        `Unknown host "${h}". Supported hosts: opencode, pi, claude, gemini`,
+        `Unknown host "${h}". Supported hosts: ${ALL_HOSTS.join(", ")}`,
       );
     }
     if (!mapped.includes(norm)) mapped.push(norm);
@@ -360,7 +385,9 @@ function configureClaudeSettings(settingsPath, binPath, { uninstall = false, dry
   }
 }
 
-function configureGeminiHooks(hooksPath, binPath, { uninstall = false, dryRun = false, actions }) {
+function configureGeminiHooks(hooksPath, binPath, { uninstall = false, dryRun = false, actions, commandFor = null }) {
+  const command = (event) =>
+    commandFor ? commandFor("gemini", event) : `${binPath} hook gemini ${event}`;
   if (uninstall) {
     if (!fs.existsSync(hooksPath)) return;
     let hooksDoc;
@@ -389,21 +416,21 @@ function configureGeminiHooks(hooksPath, binPath, { uninstall = false, dryRun = 
     SessionStart: [
       {
         type: "command",
-        command: `${binPath} hook gemini sessionstart`,
+        command: command("sessionstart"),
         timeout: 10,
       },
     ],
     PreCompact: [
       {
         type: "command",
-        command: `${binPath} hook gemini precompact`,
+        command: command("precompact"),
         timeout: 30,
       },
     ],
     Stop: [
       {
         type: "command",
-        command: `${binPath} hook gemini stop`,
+        command: command("stop"),
         timeout: 30,
       },
     ],
@@ -411,6 +438,175 @@ function configureGeminiHooks(hooksPath, binPath, { uninstall = false, dryRun = 
 
   actions.push(`merge Gemini CLI hooks into ${hooksPath}`);
   if (!dryRun) {
+    atomicWriteFileSync(hooksPath, `${JSON.stringify(hooksDoc, null, 2)}\n`);
+  }
+}
+
+function shellQuote(value) {
+  if (process.platform === "win32") {
+    return `"${String(value).replace(/"/g, '\\"')}"`;
+  }
+  return `'${String(value).replace(/'/g, `'\\''`)}'`;
+}
+
+function buildNodeHookCommand(nodePath, cliSrc, host, event) {
+  return `${shellQuote(nodePath)} ${shellQuote(cliSrc)} hook ${host} ${event}`;
+}
+
+export function resolveHookShimPath(homeDir) {
+  return process.platform === "win32"
+    ? path.join(homeDir, ".gemini", "compact-handoff-hook.cmd")
+    : null;
+}
+
+export function installHookShim(homeDir, nodePath, cliSrc, { dryRun = false, actions }) {
+  const shimPath = resolveHookShimPath(homeDir);
+  if (!shimPath) return;
+  const content = `@echo off\r\n"${nodePath}" "${cliSrc}" hook %*\r\n`;
+  actions.push(`write hook shim ${shimPath}`);
+  if (!dryRun) {
+    fs.mkdirSync(path.dirname(shimPath), { recursive: true });
+    atomicWriteFileSync(shimPath, content);
+  }
+}
+
+function buildHookCommand(nodePath, cliSrc, homeDir, host, event) {
+  if (process.platform !== "win32") {
+    return buildNodeHookCommand(nodePath, cliSrc, host, event);
+  }
+  const shimPath = resolveHookShimPath(homeDir);
+  return `${shellQuote(shimPath)} ${host} ${event}`;
+}
+
+export const COPILOT_HOOKS_FILENAME = "compact-handoff.json";
+export const ANTIGRAVITY_HOOK_KEY = "compact-handoff-antigravity";
+
+function configureCopilotHooks(
+  hooksDir,
+  nodePath,
+  cliSrc,
+  { uninstall = false, dryRun = false, actions },
+) {
+  const targetPath = path.join(hooksDir, COPILOT_HOOKS_FILENAME);
+
+  if (uninstall) {
+    if (!fs.existsSync(targetPath)) return;
+    let owned = false;
+    try {
+      const doc = readJsonFileSafe(targetPath, {});
+      const serialized = JSON.stringify(doc.hooks ?? {});
+      owned = serialized.includes('"copilot"') && serialized.includes('"hook"');
+    } catch {
+      owned = false;
+    }
+    if (!owned) {
+      actions.push(`keep unrecognized Copilot hooks ${targetPath}`);
+      return;
+    }
+    removePathAlways(targetPath, { dryRun, actions });
+    return;
+  }
+
+  const entry = (event, timeoutSec) => ({
+    type: "command",
+    exec: nodePath,
+    args: [cliSrc, "hook", "copilot", event],
+    timeoutSec,
+  });
+
+  const doc = {
+    version: 1,
+    hooks: {
+      sessionStart: [entry("sessionstart", 10)],
+      preCompact: [entry("precompact", 30)],
+      sessionEnd: [entry("sessionend", 15)],
+    },
+  };
+
+  actions.push(`write Copilot CLI hooks ${targetPath}`);
+  if (!dryRun) {
+    fs.mkdirSync(hooksDir, { recursive: true });
+    atomicWriteFileSync(targetPath, `${JSON.stringify(doc, null, 2)}\n`);
+  }
+}
+
+function configureAntigravityHooks(
+  hooksPath,
+  nodePath,
+  cliSrc,
+  homeDir,
+  { uninstall = false, dryRun = false, actions },
+) {
+  if (uninstall) {
+    if (!fs.existsSync(hooksPath)) return;
+    let hooksDoc;
+    try {
+      hooksDoc = readJsonFileSafe(hooksPath, {});
+    } catch {
+      return;
+    }
+    if (!Object.prototype.hasOwnProperty.call(hooksDoc, ANTIGRAVITY_HOOK_KEY)) {
+      return;
+    }
+    delete hooksDoc[ANTIGRAVITY_HOOK_KEY];
+    actions.push(`remove compact-handoff Antigravity hooks from ${hooksPath}`);
+    if (!dryRun) {
+      atomicWriteFileSync(hooksPath, `${JSON.stringify(hooksDoc, null, 2)}\n`);
+    }
+    return;
+  }
+
+  let hooksDoc = {};
+  if (fs.existsSync(hooksPath)) {
+    hooksDoc = readJsonFileSafe(hooksPath, {});
+  }
+
+  hooksDoc[ANTIGRAVITY_HOOK_KEY] = {
+    enabled: true,
+    SessionStart: [
+      {
+        type: "command",
+        command: buildHookCommand(
+          nodePath,
+          cliSrc,
+          homeDir,
+          "antigravity",
+          "sessionstart",
+        ),
+        timeout: 10,
+      },
+    ],
+    PreInvocation: [
+      {
+        type: "command",
+        command: buildHookCommand(
+          nodePath,
+          cliSrc,
+          homeDir,
+          "antigravity",
+          "preinvocation",
+        ),
+        timeout: 30,
+      },
+    ],
+    Stop: [
+      {
+        type: "command",
+        command: buildHookCommand(
+          nodePath,
+          cliSrc,
+          homeDir,
+          "antigravity",
+          "stop",
+        ),
+        timeout: 30,
+      },
+    ],
+  };
+
+  actions.push(`merge Antigravity hooks into ${hooksPath}`);
+  if (!dryRun) {
+    fs.mkdirSync(path.dirname(hooksPath), { recursive: true });
     atomicWriteFileSync(hooksPath, `${JSON.stringify(hooksDoc, null, 2)}\n`);
   }
 }
@@ -442,6 +638,7 @@ export async function runInstaller(options = {}) {
   const binPath = path.join(binDir, "compact-handoff");
   const legacyAliasPath = path.join(binDir, "handoff");
   const cliSrc = path.join(repoRoot, "scripts", "cli.mjs");
+  const nodePath = process.execPath;
 
   const actions = [];
 
@@ -454,6 +651,8 @@ export async function runInstaller(options = {}) {
       path.join(homeDir, ".claude", "skills", "compact-handoff"),
       path.join(openCodeDir, "skills", "compact-handoff"),
       path.join(homeDir, ".gemini", "skills", "compact-handoff"),
+      path.join(homeDir, ".omp", "agent", "skills", "compact-handoff"),
+      path.join(homeDir, ".copilot", "skills", "compact-handoff"),
     ];
     for (const dir of skillDirs) {
       removePathAlways(dir, { dryRun, actions });
@@ -491,6 +690,42 @@ export async function runInstaller(options = {}) {
         binPath,
         { uninstall: true, dryRun, actions },
       );
+    }
+    if (hosts.includes("omp")) {
+      removeIfPointsToRepo(
+        path.join(homeDir, ".omp", "agent", "extensions", "handoff.ts"),
+        path.join(repoRoot, "extensions", "omp", "handoff.ts"),
+        { dryRun, actions },
+      );
+    }
+    if (hosts.includes("copilot")) {
+      configureCopilotHooks(
+        path.join(homeDir, ".copilot", "hooks"),
+        nodePath,
+        cliSrc,
+        { uninstall: true, dryRun, actions },
+      );
+    }
+    if (hosts.includes("antigravity")) {
+      configureAntigravityHooks(
+        path.join(homeDir, ".gemini", "config", "hooks.json"),
+        nodePath,
+        cliSrc,
+        homeDir,
+        { uninstall: true, dryRun, actions },
+      );
+    }
+    if (hosts.includes("gemini") || hosts.includes("antigravity")) {
+      const shimPath = resolveHookShimPath(homeDir);
+      if (shimPath && fs.existsSync(shimPath)) {
+        let owned = false;
+        try {
+          owned = fs.readFileSync(shimPath, "utf8").includes(cliSrc);
+        } catch {
+          owned = false;
+        }
+        if (owned) removePathAlways(shimPath, { dryRun, actions });
+      }
     }
 
     return { actions, dryRun, uninstall: true, hosts };
@@ -574,15 +809,33 @@ export async function runInstaller(options = {}) {
       { copy, dryRun, actions },
     );
   }
-  if (hosts.includes("gemini")) {
+  if (hosts.includes("gemini") || hosts.includes("antigravity")) {
     installSkillDir(
       repoRoot,
       path.join(homeDir, ".gemini", "skills", "compact-handoff"),
       { copy, dryRun, actions },
     );
   }
+  if (hosts.includes("omp")) {
+    installSkillDir(
+      repoRoot,
+      path.join(homeDir, ".omp", "agent", "skills", "compact-handoff"),
+      { copy, dryRun, actions },
+    );
+  }
+  if (hosts.includes("copilot")) {
+    installSkillDir(
+      repoRoot,
+      path.join(homeDir, ".copilot", "skills", "compact-handoff"),
+      { copy, dryRun, actions },
+    );
+  }
 
   // 4. Host extensions & hooks
+  if (hosts.includes("gemini") || hosts.includes("antigravity")) {
+    installHookShim(homeDir, nodePath, cliSrc, { dryRun, actions });
+  }
+
   if (hosts.includes("opencode")) {
     const extTarget = resolveOpenCodePluginTarget(openCodeDir);
     installSymlinkOrCopy(
@@ -614,6 +867,39 @@ export async function runInstaller(options = {}) {
     configureGeminiHooks(
       path.join(homeDir, ".gemini", "config", "hooks.json"),
       binPath,
+      {
+        uninstall: false,
+        dryRun,
+        actions,
+        commandFor: (host, event) =>
+          buildHookCommand(nodePath, cliSrc, homeDir, host, event),
+      },
+    );
+  }
+
+  if (hosts.includes("omp")) {
+    installSymlinkOrCopy(
+      path.join(repoRoot, "extensions", "omp", "handoff.ts"),
+      path.join(homeDir, ".omp", "agent", "extensions", "handoff.ts"),
+      { copy, dryRun, isDir: false, actions },
+    );
+  }
+
+  if (hosts.includes("copilot")) {
+    configureCopilotHooks(
+      path.join(homeDir, ".copilot", "hooks"),
+      nodePath,
+      cliSrc,
+      { uninstall: false, dryRun, actions },
+    );
+  }
+
+  if (hosts.includes("antigravity")) {
+    configureAntigravityHooks(
+      path.join(homeDir, ".gemini", "config", "hooks.json"),
+      nodePath,
+      cliSrc,
+      homeDir,
       { uninstall: false, dryRun, actions },
     );
   }

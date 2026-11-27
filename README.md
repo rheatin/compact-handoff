@@ -10,7 +10,7 @@
 
 `compact-handoff` keeps long-running engineering sessions from losing architectural context, rationale, and dead ends when an agent hits its context window limit or when you switch tools mid-feature.
 
-> **Scope note:** `compact-handoff` is **not** a multi-agent orchestrator or task router. It does not spawn agent swarms or coordinate parallel workers — it maintains a single, surgical `<project-root>/HANDOFF.md` state file that survives context compactions and seamlessly transfers context across **OpenCode**, **Pi**, **Claude Code**, and **Gemini CLI**.
+> **Scope note:** `compact-handoff` is **not** a multi-agent orchestrator or task router. It does not spawn agent swarms or coordinate parallel workers — it maintains a single, surgical `<project-root>/HANDOFF.md` state file that survives context compactions and seamlessly transfers context across **OpenCode**, **Pi**, **Oh My Pi (`omp`)**, **Claude Code**, **Gemini CLI**, **GitHub Copilot CLI**, and **Google Antigravity**.
 
 ---
 
@@ -62,8 +62,11 @@
 | :--- | :--- | :---: | :---: | :---: | :---: |
 | **OpenCode** | Extension (`extensions/opencode/handoff.ts`) | ✅ Turn-boundary + 85% cap | ✅ `experimental.session.compaction.provide` | ✅ `chat.message` | ✅ Skips child/subagent sessions |
 | **Pi (`pi`)** | Extension (`extensions/pi/handoff.ts`) | ✅ `agent_end` + `turn_end` 85% cap | ✅ `session_before_compact` | ✅ `before_agent_start` | ✅ Skips `PI_SUBAGENT_CHILD` |
+| **Oh My Pi (`omp`)** | Extension (`extensions/omp/handoff.ts`) | ✅ `session_before_compact` + `agent_end`/`turn_end` cap | ⚠️ Injects the HANDOFF window via `session.compacting`; omp keeps its own summary/`/handoff` | ✅ `before_agent_start` | ✅ Skips `ctx.agent.kind === "sub"` |
 | **Claude Code** | Hooks (`~/.claude/settings.json`) | ✅ `PreCompact` hook | ⚠️ Advisory `systemMessage` | ✅ `SessionStart` `additionalContext` | ✅ Recursion guard |
 | **Gemini CLI** | Hooks (`~/.gemini/config/hooks.json`) | ✅ `PreCompact` + `Stop` threshold | ⚠️ Hook capture prior to reset | ✅ `SessionStart` `additionalContext` | ✅ Recursion guard |
+| **GitHub Copilot CLI** | Hooks (`~/.copilot/hooks/compact-handoff.json`) | ✅ `preCompact` hook | ⚠️ Advisory (notification-only hook) | ✅ `sessionStart` `additionalContext` | ✅ Recursion guard |
+| **Google Antigravity** | Hooks (`~/.gemini/config/hooks.json`) | ✅ `PreInvocation` + `Stop` threshold | ⚠️ Advisory (capture before reset) | ✅ `SessionStart` `injectSteps` | ✅ Recursion guard |
 
 ---
 
@@ -77,7 +80,7 @@ npx skills add rheatin/compact-handoff
 
 ### Option B: Full Multi-Host Setup (Recommended)
 
-Clone the repository and run the idempotent installer to wire the CLI (`~/.local/bin/compact-handoff`), unified config (`~/.config/handoff/config.json`), skill directories, OpenCode/Pi extensions, and Claude Code / Gemini CLI hooks:
+Clone the repository and run the idempotent installer to wire the CLI (`~/.local/bin/compact-handoff`), unified config (`~/.config/handoff/config.json`), skill directories, OpenCode/Pi/omp extensions, and Claude Code / Gemini CLI / Copilot CLI / Antigravity hooks:
 
 ```bash
 git clone https://github.com/rheatin/compact-handoff.git
@@ -89,15 +92,18 @@ node scripts/install.mjs --dry-run
 # Install default hosts (OpenCode, Pi, Claude Code)
 node scripts/install.mjs
 
-# Or include Gemini CLI and customize threshold
-node scripts/install.mjs --hosts opencode,pi,claude,gemini --percentage 50
+# Wire every supported host and customize the threshold
+node scripts/install.mjs --hosts all --percentage 50
+
+# Just the hosts used on this machine
+node scripts/install.mjs --hosts omp,copilot,antigravity
 ```
 
 #### Installer Options
 
 ```bash
 node scripts/install.mjs [options]
-  --hosts <list>          opencode,pi,claude,gemini or "all" (default: opencode,pi,claude)
+  --hosts <list>          opencode,pi,claude,gemini,omp,copilot,antigravity or "all" (default: opencode,pi,claude)
   --opencode-dir <dir>    Override OpenCode config dir (default: $OPENCODE_CONFIG_DIR or ~/.config/opencode)
   --mode <mode>           percentage | tokens | auto
   --percentage <1-100>    Context percentage trigger (default: 50)
@@ -114,7 +120,7 @@ node scripts/install.mjs [options]
 
 ## Configuration (`~/.config/handoff/config.json`)
 
-All four hosts read the same configuration file at `~/.config/handoff/config.json` (overridable via `HANDOFF_CONFIG_PATH`):
+All hosts read the same configuration file at `~/.config/handoff/config.json` (overridable via `HANDOFF_CONFIG_PATH`):
 
 ```json
 {
@@ -143,8 +149,8 @@ compact-handoff capture [--trigger auto|manual|session-end] [--agent <name>] [--
 compact-handoff context [dir]
 compact-handoff config --show
 compact-handoff config [--mode percentage|tokens|auto] [--percentage 50] [--tokens 100000] [--session-end on|off] [--subagent on|off] [--auto-exclude on|off] [--model current]
-compact-handoff install [--hosts opencode,pi,claude,gemini] [--dry-run] [--uninstall]
-compact-handoff hook <claude|gemini> <precompact|sessionstart|sessionend|stop>
+compact-handoff install [--hosts opencode,pi,claude,gemini,omp,copilot,antigravity] [--dry-run] [--uninstall]
+compact-handoff hook <claude|gemini|copilot|antigravity> <precompact|sessionstart|sessionend|preinvocation|stop>
 ```
 
 ---
@@ -208,7 +214,7 @@ Lightweight HTTP/WebSocket session broker written in TypeScript.
 npm test
 ```
 
-Runs `node --test tests/*.test.mjs` covering core markdown splicing, secret redaction, 45 KB fair-share diffs, OpenCode extension turn-boundary deferral & backoff, Pi extension lifecycle, idempotent multi-host installation/uninstallation, and Claude/Gemini CLI hook protocols.
+Runs `node --test tests/*.test.mjs` covering core markdown splicing, secret redaction, 45 KB fair-share diffs, OpenCode extension turn-boundary deferral & backoff, Pi and omp extension lifecycles, idempotent multi-host installation/uninstallation, and Claude/Gemini/Copilot/Antigravity CLI hook protocols.
 
 ---
 

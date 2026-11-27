@@ -1108,3 +1108,428 @@ test("Pi session_before_compact and CLI precompact hook support pure-discussion 
   assert.match(cliHandoff, /Design zero-downtime DB migration workflow/);
   assert.match(cliHandoff, /Should dual-write run synchronously or via outbox queue\?/);
 });
+
+// ---------------------------------------------------------------------------
+// 4. Oh My Pi (omp) Extension Tests
+// ---------------------------------------------------------------------------
+
+const OMP_EXTENSION_PATH = path.join(REPO_ROOT, "extensions", "omp", "handoff.ts");
+const ompExtModule = await import(pathToFileURL(OMP_EXTENSION_PATH).href);
+const setupOmpHandoffExtension = ompExtModule.default;
+
+function createMockOmpHarness() {
+  const handlers = new Map();
+  const pi = {
+    on(event, handler) {
+      const list = handlers.get(event) ?? [];
+      list.push(handler);
+      handlers.set(event, list);
+      return () => {
+        const idx = list.indexOf(handler);
+        if (idx !== -1) list.splice(idx, 1);
+      };
+    },
+  };
+  setupOmpHandoffExtension(pi);
+
+  return {
+    async emit(event, payload, ctx) {
+      const list = handlers.get(event) ?? [];
+      let lastResult;
+      for (const fn of list) {
+        const res = await fn(payload, ctx);
+        if (res !== undefined) lastResult = res;
+      }
+      return lastResult;
+    },
+  };
+}
+
+function writeHandoffFixture(repoDir) {
+  fs.writeFileSync(
+    path.join(repoDir, "HANDOFF.md"),
+    [
+      "# Handoff",
+      "",
+      "> Last updated: 2026-11-26T10:00:00.000Z (via pi · manual)",
+      "",
+      "## Overview",
+      "",
+      "omp handoff bridge.",
+      "",
+      "## Current status",
+      "",
+      "**Done**",
+      "- Wired omp extension",
+      "",
+      "**In progress**",
+      "- Validating compaction capture",
+      "",
+      "**Next**",
+      "- Run host smoke test",
+      "",
+      "## Decision log",
+      "",
+      "- 2026-11-26: Keep HANDOFF.md authoritative across hosts.",
+      "",
+      "## Gotchas / constraints",
+      "",
+      "- None.",
+      "",
+      "## Open questions",
+      "",
+      "- None.",
+      "",
+      "## Commands",
+      "",
+      "- `npm test`",
+      "",
+    ].join("\n"),
+    "utf8",
+  );
+}
+
+test("omp extension: startup injection, pre-compaction capture, summarizer context, and subagent isolation", async (t) => {
+  const repoDir = createTempGitRepo("handoff-omp-");
+  const cfgDir = fs.mkdtempSync(path.join(os.tmpdir(), "handoff-omp-cfg-"));
+  const prevConfig = process.env.HANDOFF_CONFIG_PATH;
+  const prevExternal = process.env.HANDOFF_DISABLE_EXTERNAL_LLM;
+  t.after(() => {
+    fs.rmSync(repoDir, { recursive: true, force: true });
+    fs.rmSync(cfgDir, { recursive: true, force: true });
+    if (prevConfig === undefined) delete process.env.HANDOFF_CONFIG_PATH;
+    else process.env.HANDOFF_CONFIG_PATH = prevConfig;
+    if (prevExternal === undefined) delete process.env.HANDOFF_DISABLE_EXTERNAL_LLM;
+    else process.env.HANDOFF_DISABLE_EXTERNAL_LLM = prevExternal;
+  });
+
+  process.env.HANDOFF_CONFIG_PATH = writeTempConfig(cfgDir);
+  process.env.HANDOFF_DISABLE_EXTERNAL_LLM = "1";
+
+  const harness = createMockOmpHarness();
+  const entries = [
+    {
+      type: "message",
+      message: {
+        role: "user",
+        content: [{ type: "text", text: "Goal: fix omp session capture." }],
+      },
+    },
+    {
+      type: "message",
+      message: {
+        role: "assistant",
+        content: [
+          {
+            type: "text",
+            text: "Wired extensions/omp/handoff.ts and verified session_before_compact.",
+          },
+          {
+            type: "toolCall",
+            name: "edit",
+            arguments: { path: "extensions/omp/handoff.ts" },
+          },
+        ],
+      },
+    },
+  ];
+  const ctx = {
+    cwd: repoDir,
+    agent: { kind: "main", id: "Main", name: "main", depth: 0 },
+    sessionManager: { getBranch: () => entries },
+    getContextUsage: () => ({ tokens: 10, contextWindow: 1000, percent: 1 }),
+    compact: async () => undefined,
+  };
+
+  await harness.emit("session_start", { type: "session_start" }, ctx);
+
+  // No HANDOFF.md yet: no startup injection.
+  assert.equal(
+    await harness.emit("before_agent_start", { type: "before_agent_start" }, ctx),
+    undefined,
+  );
+
+  writeHandoffFixture(repoDir);
+  await harness.emit("session_start", { type: "session_start" }, ctx);
+  const injected = await harness.emit(
+    "before_agent_start",
+    { type: "before_agent_start" },
+    ctx,
+  );
+  assert.match(injected.message.content, /\[Handoff Context from HANDOFF\.md\]/);
+  assert.match(injected.message.content, /Wired omp extension/);
+  assert.equal(injected.message.display, false);
+
+  writeHandoffFixture(repoDir);
+  const compactResult = await harness.emit(
+    "session_before_compact",
+    { type: "session_before_compact", reason: "auto" },
+    ctx,
+  );
+  assert.equal(compactResult, undefined);
+  const handoff = fs.readFileSync(path.join(repoDir, "HANDOFF.md"), "utf8");
+  assert.match(handoff, /\(via omp · auto\)/);
+  assert.match(handoff, /omp session capture/);
+
+  const summarizer = await harness.emit(
+    "session.compacting",
+    { type: "session.compacting", sessionId: "omp-1", messages: [] },
+    ctx,
+  );
+  assert.match(summarizer.context[0], /# Handoff/);
+
+  // Subagent sessions never capture or inject.
+  const subRepo = createTempGitRepo("handoff-omp-sub-");
+  t.after(() => fs.rmSync(subRepo, { recursive: true, force: true }));
+  const subCtx = {
+    ...ctx,
+    cwd: subRepo,
+    agent: { kind: "sub", id: "Sub", name: "explore", depth: 1 },
+  };
+  await harness.emit(
+    "session_before_compact",
+    { type: "session_before_compact", reason: "auto" },
+    subCtx,
+  );
+  assert.equal(fs.existsSync(path.join(subRepo, "HANDOFF.md")), false);
+});
+
+// ---------------------------------------------------------------------------
+// 5. GitHub Copilot CLI & Antigravity Hook Tests
+// ---------------------------------------------------------------------------
+
+test("compact-handoff hook copilot sessionstart | precompact | sessionend", (t) => {
+  const repoDir = createTempGitRepo("handoff-copilot-");
+  const cfgDir = fs.mkdtempSync(path.join(os.tmpdir(), "handoff-copilot-cfg-"));
+  t.after(() => {
+    fs.rmSync(repoDir, { recursive: true, force: true });
+    fs.rmSync(cfgDir, { recursive: true, force: true });
+  });
+
+  writeHandoffFixture(repoDir);
+  const start = runHookCli(["copilot", "sessionstart"], {
+    sessionId: "copilot-1",
+    cwd: repoDir,
+    source: "startup",
+  });
+  assert.match(start.json.additionalContext, /# Handoff/);
+  assert.match(start.json.additionalContext, /omp handoff bridge/);
+
+  const transcriptPath = path.join(cfgDir, "transcript.jsonl");
+  fs.writeFileSync(
+    transcriptPath,
+    [
+      JSON.stringify({
+        type: "message",
+        message: {
+          role: "user",
+          content: [{ type: "text", text: "Goal: wire Copilot CLI preCompact." }],
+        },
+      }),
+      JSON.stringify({
+        type: "message",
+        message: {
+          role: "assistant",
+          content: [{ type: "text", text: "Wired ~/.copilot/hooks/compact-handoff.json." }],
+        },
+      }),
+    ].join("\n") + "\n",
+    "utf8",
+  );
+
+  const cfgPath = writeTempConfig(cfgDir, { captureOnSessionEnd: true });
+  const pre = runHookCli(
+    ["copilot", "precompact"],
+    {
+      sessionId: "copilot-1",
+      cwd: repoDir,
+      transcriptPath,
+      trigger: "auto",
+      customInstructions: "",
+    },
+    { env: { HANDOFF_CONFIG_PATH: cfgPath } },
+  );
+  assert.deepEqual(pre.json, {});
+  let handoff = fs.readFileSync(path.join(repoDir, "HANDOFF.md"), "utf8");
+  assert.match(handoff, /\(via copilot-cli · auto\)/);
+
+  const endRepo = createTempGitRepo("handoff-copilot-end-");
+  t.after(() => fs.rmSync(endRepo, { recursive: true, force: true }));
+  const end = runHookCli(
+    ["copilot", "sessionend"],
+    { sessionId: "copilot-2", cwd: endRepo, reason: "complete" },
+    { env: { HANDOFF_CONFIG_PATH: cfgPath } },
+  );
+  assert.deepEqual(end.json, {});
+  const endHandoff = fs.readFileSync(path.join(endRepo, "HANDOFF.md"), "utf8");
+  assert.match(endHandoff, /\(via copilot-cli · session-end\)/);
+});
+
+test("compact-handoff hook antigravity sessionstart | preinvocation | stop", (t) => {
+  const repoDir = createTempGitRepo("handoff-antigravity-");
+  const cfgDir = fs.mkdtempSync(path.join(os.tmpdir(), "handoff-antigravity-cfg-"));
+  t.after(() => {
+    fs.rmSync(repoDir, { recursive: true, force: true });
+    fs.rmSync(cfgDir, { recursive: true, force: true });
+  });
+
+  writeHandoffFixture(repoDir);
+  const start = runHookCli(["antigravity", "sessionstart"], {
+    conversationId: "agy-1",
+    workspacePaths: [repoDir],
+    modelName: "gemini-3.6-flash-medium",
+  });
+  assert.match(
+    start.json.injectSteps[0].systemMessage.systemMessage,
+    /# Handoff/,
+  );
+  assert.match(
+    start.json.injectSteps[0].systemMessage.systemMessage,
+    /omp handoff bridge/,
+  );
+
+  const transcriptPath = path.join(cfgDir, "transcript.jsonl");
+  fs.writeFileSync(
+    transcriptPath,
+    [
+      JSON.stringify({
+        type: "message",
+        message: {
+          role: "user",
+          content: [{ type: "text", text: "Goal: wire Antigravity hooks." }],
+        },
+      }),
+      JSON.stringify({
+        type: "message",
+        message: {
+          role: "assistant",
+          content: [{ type: "text", text: "Wired ~/.gemini/config/hooks.json." }],
+        },
+      }),
+    ].join("\n") + "\n",
+    "utf8",
+  );
+
+  const cfgPath = writeTempConfig(cfgDir, {
+    trigger: { mode: "percentage", percentage: 50 },
+    captureOnSessionEnd: false,
+  });
+  const pre = runHookCli(
+    ["antigravity", "preinvocation"],
+    {
+      conversationId: "agy-1",
+      workspacePaths: [repoDir],
+      transcriptPath,
+      invocationNum: 3,
+      initialNumSteps: 12,
+      contextUsage: { tokens: 600000, contextWindow: 1048576 },
+      modelName: "gemini-3.6-flash-medium",
+    },
+    { env: { HANDOFF_CONFIG_PATH: cfgPath } },
+  );
+  assert.deepEqual(pre.json, {});
+  let handoff = fs.readFileSync(path.join(repoDir, "HANDOFF.md"), "utf8");
+  assert.match(handoff, /\(via antigravity · auto\)/);
+
+  // Below threshold and no session-end capture: Stop is a no-op.
+  const quietRepo = createTempGitRepo("handoff-antigravity-quiet-");
+  t.after(() => fs.rmSync(quietRepo, { recursive: true, force: true }));
+  const stop = runHookCli(
+    ["antigravity", "stop"],
+    {
+      conversationId: "agy-2",
+      workspacePaths: [quietRepo],
+      transcriptPath,
+      contextUsage: { tokens: 1000, contextWindow: 1048576 },
+    },
+    { env: { HANDOFF_CONFIG_PATH: cfgPath } },
+  );
+  assert.deepEqual(stop.json, {});
+  assert.equal(fs.existsSync(path.join(quietRepo, "HANDOFF.md")), false);
+});
+
+// ---------------------------------------------------------------------------
+// 6. New Host Installer Tests
+// ---------------------------------------------------------------------------
+
+test("install.mjs wires omp, copilot, and antigravity idempotently and uninstalls cleanly", async (t) => {
+  const fakeHome = fs.mkdtempSync(path.join(os.tmpdir(), "handoff-home-new-"));
+  t.after(() => fs.rmSync(fakeHome, { recursive: true, force: true }));
+
+  const geminiConfigDir = path.join(fakeHome, ".gemini", "config");
+  fs.mkdirSync(geminiConfigDir, { recursive: true });
+  fs.writeFileSync(
+    path.join(geminiConfigDir, "hooks.json"),
+    JSON.stringify({ customHook: { enabled: true } }, null, 2),
+    "utf8",
+  );
+
+  const copilotHooksDir = path.join(fakeHome, ".copilot", "hooks");
+  fs.mkdirSync(copilotHooksDir, { recursive: true });
+  fs.writeFileSync(
+    path.join(copilotHooksDir, "custom.json"),
+    JSON.stringify({ version: 1, hooks: { sessionStart: [] } }, null, 2),
+    "utf8",
+  );
+
+  const hosts = ["omp", "copilot", "antigravity"];
+  await runInstaller({ homeDir: fakeHome, hosts });
+  await runInstaller({ homeDir: fakeHome, hosts });
+
+  assert.equal(
+    fs.existsSync(path.join(fakeHome, ".omp", "agent", "extensions", "handoff.ts")),
+    true,
+  );
+  assert.equal(
+    fs.existsSync(
+      path.join(fakeHome, ".omp", "agent", "skills", "compact-handoff", "SKILL.md"),
+    ),
+    true,
+  );
+  assert.equal(
+    fs.existsSync(
+      path.join(fakeHome, ".copilot", "skills", "compact-handoff", "SKILL.md"),
+    ),
+    true,
+  );
+
+  const copilotHooks = JSON.parse(
+    fs.readFileSync(path.join(copilotHooksDir, "compact-handoff.json"), "utf8"),
+  );
+  assert.equal(copilotHooks.version, 1);
+  assert.equal(copilotHooks.hooks.sessionStart[0].exec, process.execPath);
+  assert.deepEqual(copilotHooks.hooks.sessionStart[0].args.slice(-2), [
+    "copilot",
+    "sessionstart",
+  ]);
+  assert.equal(copilotHooks.hooks.preCompact[0].args.at(-1), "precompact");
+  assert.equal(copilotHooks.hooks.sessionEnd[0].args.at(-1), "sessionend");
+
+  const hooksDoc = JSON.parse(
+    fs.readFileSync(path.join(geminiConfigDir, "hooks.json"), "utf8"),
+  );
+  assert.deepEqual(hooksDoc.customHook, { enabled: true });
+  assert.equal(hooksDoc["compact-handoff-antigravity"].enabled, true);
+  assert.match(
+    hooksDoc["compact-handoff-antigravity"].PreInvocation[0].command,
+    /antigravity preinvocation/,
+  );
+
+  await runInstaller({ homeDir: fakeHome, hosts, uninstall: true });
+
+  assert.equal(
+    fs.existsSync(path.join(fakeHome, ".omp", "agent", "extensions", "handoff.ts")),
+    false,
+  );
+  assert.equal(
+    fs.existsSync(path.join(fakeHome, ".omp", "agent", "skills", "compact-handoff")),
+    false,
+  );
+  assert.equal(fs.existsSync(path.join(copilotHooksDir, "compact-handoff.json")), false);
+  assert.equal(fs.existsSync(path.join(copilotHooksDir, "custom.json")), true);
+
+  const hooksAfter = JSON.parse(
+    fs.readFileSync(path.join(geminiConfigDir, "hooks.json"), "utf8"),
+  );
+  assert.deepEqual(hooksAfter, { customHook: { enabled: true } });
+});

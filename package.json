@@ -2,7 +2,7 @@
   "name": "compact-handoff",
   "version": "0.1.0",
   "type": "module",
-  "description": "Pre-compaction HANDOFF.md generator and compaction replacement for coding agents (OpenCode, Pi, Claude Code, Gemini CLI)",
+  "description": "Pre-compaction HANDOFF.md generator and compaction replacement for coding agents (OpenCode, Pi, Oh My Pi, Claude Code, Gemini CLI, GitHub Copilot CLI, Antigravity)",
   "license": "MIT",
   "engines": {
     "node": ">=18"
@@ -28,8 +28,11 @@
     "coding-agents",
     "opencode",
     "pi",
+    "omp",
     "claude-code",
     "gemini-cli",
+    "copilot-cli",
+    "antigravity",
     "context-window"
   ]
 }
